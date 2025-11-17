@@ -1,0 +1,5 @@
+# working folders, files
+data/*
+timespan_data/*
+*.xlsx
+*.json
