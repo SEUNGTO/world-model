@@ -21,7 +21,7 @@ HF_AVAILABLE = True
 
 # Feature sizes
 TICK_FEAT_DIM = 3        # e.g., [price, volume, trade_type]
-MACRO_DIM_IN = 10
+MACRO_DIM_IN = 10        # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
 LATENT_DIM = 128         # latent world-state dimensionality (s_t)
 FUSED_DIM = 128          # fusion dim
 MAX_OBS_TICKS = 1024     # pad length for observation tick seq
@@ -72,6 +72,12 @@ class WorldModelDataset(Dataset):
       - next_tick: (MAX_TARGET_TICKS, feat)
       - next_mask: (MAX_TARGET_TICKS,)
     """
+    # 2025. 11. 18. 데이터를 어떻게 설계할 지 고민해봐야 함
+    # 일단 tick data는 어떤 변수를 넣을지 고민해보고
+    # 고민한 결과에 맞게 데이터를 구성할 필요 있음
+    # GPT에 물어보면 데이터를 전처리 한 후에 tensor로 저장하는 게 가장 좋다고 함
+    # 전처리 하는 로직은 다시 고민
+
     def __init__(self, index_list):
         super().__init__()
         self.indexes = index_list
@@ -325,12 +331,16 @@ def get_timestep_embedding(timesteps, dim):
 # Training loop
 # ---------------------------
 def train():
-    ds = WorldModelDataset(list(range(2000)))
+
+    print('Load Dataset')
+    ds = WorldModelDataset(list(range(100)))
     loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
+    print('Define model and optimizer')
     model = WorldModel().to(DEVICE)
     optim = torch.optim.AdamW(model.parameters(), lr=LR)
 
+    print('Training begins')
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0.0
@@ -356,7 +366,7 @@ def train():
             t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
             noise = torch.randn_like(s_next_target)
             z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
-            t_emb = get_timestep_embedding(t, LATENT_DIM).to(DEVICE)
+            t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
             # predict noise from z_t conditioned on s_t
             noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
             loss_diff = F.mse_loss(noise_pred, noise)
@@ -407,7 +417,7 @@ def sample_one_step(model: WorldModel, obs_tick, obs_mask, news_list, macro_vec,
     z = torch.randn(1, LATENT_DIM, device=device)  # start from noise
     for t_idx in reversed(range(0, scheduler.timesteps)):
         t = torch.full((1,), t_idx, dtype=torch.long, device=device)
-        t_emb = get_timestep_embedding(t, LATENT_DIM).to(device)
+        t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(device)
         eps_pred = model.denoise_latent(z, s_t, t_emb=t_emb)  # predict noise
         beta = scheduler.betas[t_idx].item()
         alpha = scheduler.alphas[t_idx].item()
@@ -429,18 +439,21 @@ def sample_one_step(model: WorldModel, obs_tick, obs_mask, news_list, macro_vec,
 # Example: run train (if executed as script)
 # ---------------------------
 if __name__ == "__main__":
-    train()
+    # train()
 
     # Example of sampling after training (pseudo)
-    # model = WorldModel().to(DEVICE)
-    # ck = torch.load(os.path.join(CKPT_DIR, "wm_epoch_40.pt"))
-    # model.load_state_dict(ck["model"])
-    # model.eval()
-    # # create dummy obs
-    # obs_tick = torch.randn(1, MAX_OBS_TICKS, TICK_FEAT_DIM)
-    # obs_mask = torch.zeros(1, MAX_OBS_TICKS).bool()
-    # obs_mask[0, :200] = 1
-    # news = ["earnings release"]
-    # macro = torch.randn(1, MACRO_DIM_IN)
-    # gen = sample_one_step(model, obs_tick, obs_mask, news, macro, target_len=300)
-    # print("generated shape:", gen.shape)
+    model = WorldModel().to(DEVICE)
+    ck = torch.load(os.path.join(CKPT_DIR, "wm_epoch_18.pt"))
+    model.load_state_dict(ck["model"])
+    model.eval()
+    # create dummy obs
+    obs_tick = torch.randn(1, MAX_OBS_TICKS, TICK_FEAT_DIM)
+    obs_mask = torch.zeros(1, MAX_OBS_TICKS).bool()
+    obs_mask[0, :200] = 1
+    news = ["earnings release"]
+    macro = torch.randn(1, MACRO_DIM_IN)
+    gen = sample_one_step(model, obs_tick, obs_mask, news, macro, target_len=300)
+    print("generated shape:", gen.shape)
+    
+    import pdb
+    pdb.set_trace()

@@ -3,3 +3,7 @@ data/*
 timespan_data/*
 *.xlsx
 *.json
+wm_ckpt/*
+
+# playground, test script
+test.py
