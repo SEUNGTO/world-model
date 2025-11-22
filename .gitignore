@@ -1,6 +1,8 @@
 # working folders, files
-data/*
-timespan_data/*
+tick/*
+timespan_tick/*
+timespan_news/*
+processed_dataset/*
 *.xlsx
 *.json
 wm_ckpt/*

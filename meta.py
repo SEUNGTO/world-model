@@ -414,3 +414,32 @@ tick_kosdaq = [
     'datatype' : float,
   }
 ]
+
+
+news = [
+  {
+    'col_nm_eng'     : 'doc_id',
+    'col_description' : '문서 고유 아이디',
+    'datatype' : str,
+  },
+  {
+    'col_nm_eng'     : 'title',
+    'col_description' : '기사 제목',
+    'datatype' : str,
+  },
+  {
+    'col_nm_eng'     : 'url',
+    'col_description' : '기사 URL',
+    'datatype' : str,
+  },
+  {
+    'col_nm_eng'     : 'posttime',
+    'col_description' : '게시 시간',
+    'datatype' : str,
+  },
+  {
+    'col_nm_eng'     : 'article',
+    'col_description' : '기사 본문',
+    'datatype' : str,
+  },
+]

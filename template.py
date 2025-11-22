@@ -27,6 +27,11 @@ FUSED_DIM = 128          # fusion dim
 MAX_OBS_TICKS = 1024     # pad length for observation tick seq
 MAX_TARGET_TICKS = 1024  # pad length for target tick seq
 
+# 실제 데이터 기준 parameter
+TICK_FEAT_DIM = 12
+MAX_OBS_TICKS = 2**15
+
+
 DIFFUSION_STEPS = 500
 SAMPLE_STEPS = 100
 
@@ -62,54 +67,78 @@ scheduler = LatentDiffusionScheduler()
 # ---------------------------
 # Dataset skeleton
 # ---------------------------
-class WorldModelDataset(Dataset):
-    """
-    Returns:
-      - obs_tick: (MAX_OBS_TICKS, feat) padded
-      - obs_mask: (MAX_OBS_TICKS,) bool
-      - news_texts: List[str] per sample
-      - macro_vec: (MACRO_DIM_IN,)
-      - next_tick: (MAX_TARGET_TICKS, feat)
-      - next_mask: (MAX_TARGET_TICKS,)
-    """
-    # 2025. 11. 18. 데이터를 어떻게 설계할 지 고민해봐야 함
-    # 일단 tick data는 어떤 변수를 넣을지 고민해보고
-    # 고민한 결과에 맞게 데이터를 구성할 필요 있음
-    # GPT에 물어보면 데이터를 전처리 한 후에 tensor로 저장하는 게 가장 좋다고 함
-    # 전처리 하는 로직은 다시 고민
+# class WorldModelDataset(Dataset):
+#     """
+#     Returns:
+#       - obs_tick: (MAX_OBS_TICKS, feat) padded
+#       - obs_mask: (MAX_OBS_TICKS,) bool
+#       - news_texts: List[str] per sample
+#       - macro_vec: (MACRO_DIM_IN,)
+#       - next_tick: (MAX_TARGET_TICKS, feat)
+#       - next_mask: (MAX_TARGET_TICKS,)
+#     """
+#     # 2025. 11. 18. 데이터를 어떻게 설계할 지 고민해봐야 함
+#     # 일단 tick data는 어떤 변수를 넣을지 고민해보고
+#     # 고민한 결과에 맞게 데이터를 구성할 필요 있음
+#     # GPT에 물어보면 데이터를 전처리 한 후에 tensor로 저장하는 게 가장 좋다고 함
+#     # 전처리 하는 로직은 다시 고민
 
-    def __init__(self, index_list):
+#     def __init__(self, index_list):
+#         super().__init__()
+#         self.indexes = index_list
+
+#     def __len__(self):
+#         return len(self.indexes)
+
+#     def __getitem__(self, idx):
+#         # Replace this with real data loading
+#         # Simulate variable-length tick sequences
+#         n_obs = random.randint(50, 600)
+#         n_next = random.randint(50, 800)
+#         obs = torch.randn(n_obs, TICK_FEAT_DIM)
+#         obs_padded = torch.zeros(MAX_OBS_TICKS, TICK_FEAT_DIM)
+#         obs_padded[:n_obs] = obs
+#         obs_mask = torch.zeros(MAX_OBS_TICKS, dtype=torch.bool)
+#         obs_mask[:n_obs] = 1
+
+#         nxt = torch.randn(n_next, TICK_FEAT_DIM)
+#         nxt_padded = torch.zeros(MAX_TARGET_TICKS, TICK_FEAT_DIM)
+#         nxt_padded[:n_next] = nxt
+#         nxt_mask = torch.zeros(MAX_TARGET_TICKS, dtype=torch.bool)
+#         nxt_mask[:n_next] = 1
+
+#         news = ["company A beats earnings", "central bank decision"] if random.random() < 0.7 else []
+#         macro = torch.randn(MACRO_DIM_IN)
+
+#         return {
+#             "obs_tick": obs_padded, "obs_mask": obs_mask,
+#             "news": news, "macro": macro,
+#             "next_tick": nxt_padded, "next_mask": nxt_mask
+#         }
+
+class WorldModelDataset(Dataset):
+    def __init__(self, root="processed_dataset"):
         super().__init__()
-        self.indexes = index_list
+        self.root = root
+        self.files = sorted(os.listdir(root))  # 000000.pt 순서 정렬됨
 
     def __len__(self):
-        return len(self.indexes)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        # Replace this with real data loading
-        # Simulate variable-length tick sequences
-        n_obs = random.randint(50, 600)
-        n_next = random.randint(50, 800)
-        obs = torch.randn(n_obs, TICK_FEAT_DIM)
-        obs_padded = torch.zeros(MAX_OBS_TICKS, TICK_FEAT_DIM)
-        obs_padded[:n_obs] = obs
-        obs_mask = torch.zeros(MAX_OBS_TICKS, dtype=torch.bool)
-        obs_mask[:n_obs] = 1
-
-        nxt = torch.randn(n_next, TICK_FEAT_DIM)
-        nxt_padded = torch.zeros(MAX_TARGET_TICKS, TICK_FEAT_DIM)
-        nxt_padded[:n_next] = nxt
-        nxt_mask = torch.zeros(MAX_TARGET_TICKS, dtype=torch.bool)
-        nxt_mask[:n_next] = 1
-
-        news = ["company A beats earnings", "central bank decision"] if random.random() < 0.7 else []
-        macro = torch.randn(MACRO_DIM_IN)
+        file_path = os.path.join(self.root, self.files[idx])
+        data = torch.load(file_path, weights_only=False)
 
         return {
-            "obs_tick": obs_padded, "obs_mask": obs_mask,
-            "news": news, "macro": macro,
-            "next_tick": nxt_padded, "next_mask": nxt_mask
+            "obs_tick": data["obs_tick"],
+            "obs_mask": data["obs_mask"],
+            "news": data["news"],
+            "macro": data["macro"],
+            "next_tick": data["next_tick"],
+            "next_mask": data["next_mask"],
         }
+
+
 
 def collate_fn(batch):
     # Keep as-is for flexibility (list of dicts)
@@ -255,13 +284,51 @@ class LatentDenoiser(nn.Module):
 #   - expand latent to sequence-length features
 #   - pass through Transformer encoder + linear output
 # ---------------------------
+# class LatentToTicksDecoder(nn.Module):
+#     def __init__(self, latent_dim=LATENT_DIM, out_feat=TICK_FEAT_DIM, model_dim=256, max_len=MAX_TARGET_TICKS):
+#         super().__init__()
+#         self.max_len = max_len
+#         self.latent_proj = nn.Linear(latent_dim, model_dim)
+#         enc_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=4, batch_first=True)
+#         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+#         self.pos = self._build_pe(model_dim, max_len)
+#         self.out = nn.Linear(model_dim, out_feat)
+
+#     def _build_pe(self, d_model, max_len):
+#         pe = torch.zeros(max_len, d_model)
+#         pos = torch.arange(0, max_len).unsqueeze(1).float()
+#         i = torch.arange(0, d_model, 2).float()
+#         div = torch.exp(i * -(math.log(10000.0) / d_model))
+#         pe[:, 0::2] = torch.sin(pos * div)
+#         pe[:, 1::2] = torch.cos(pos * div)
+#         return pe  # buffer registered in forward for simplicity
+
+#     def forward(self, latent, target_len, mask=None):
+#         # latent: (B, latent_dim)
+#         B = latent.size(0)
+#         device = latent.device
+#         rep = self.latent_proj(latent).unsqueeze(1).repeat(1, target_len, 1)  # (B, L, model_dim)
+#         pe = self.pos[:target_len, :].to(device).unsqueeze(0)  # (1, L, model_dim)
+#         h = rep + pe
+#         h = self.transformer(h)  # (B, L, model_dim)
+#         out = self.out(h)        # (B, L, feat)
+#         if mask is not None:
+#             out = out * mask.unsqueeze(-1).float()
+#         return out
+
 class LatentToTicksDecoder(nn.Module):
     def __init__(self, latent_dim=LATENT_DIM, out_feat=TICK_FEAT_DIM, model_dim=256, max_len=MAX_TARGET_TICKS):
         super().__init__()
         self.max_len = max_len
         self.latent_proj = nn.Linear(latent_dim, model_dim)
-        enc_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=4, batch_first=True)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=model_dim,
+            nhead=4,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerDecoder(dec_layer, num_layers=3)
+
         self.pos = self._build_pe(model_dim, max_len)
         self.out = nn.Linear(model_dim, out_feat)
 
@@ -272,17 +339,45 @@ class LatentToTicksDecoder(nn.Module):
         div = torch.exp(i * -(math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        return pe  # buffer registered in forward for simplicity
+        return pe
+
+    def _causal_mask(self, size, device):
+        # True means masked (upper triangular, excluding diagonal)
+        return torch.triu(torch.ones(size, size, device=device), diagonal=1).bool()
 
     def forward(self, latent, target_len, mask=None):
-        # latent: (B, latent_dim)
+        """
+        latent: (B, latent_dim) -- conditioning latent (e.g., s_next or sampled z)
+        target_len: int
+        mask: (B, L) boolean tensor for output positions (optional)
+        """
         B = latent.size(0)
         device = latent.device
-        rep = self.latent_proj(latent).unsqueeze(1).repeat(1, target_len, 1)  # (B, L, model_dim)
-        pe = self.pos[:target_len, :].to(device).unsqueeze(0)  # (1, L, model_dim)
-        h = rep + pe
-        h = self.transformer(h)  # (B, L, model_dim)
-        out = self.out(h)        # (B, L, feat)
+
+        # 1) latent -> model_dim projection
+        latent_proj = self.latent_proj(latent)           # (B, D)
+
+        # 2) build memory for cross-attention: shape (B, S=1, D)
+        #    The decoder will attend to this memory for conditioning.
+        memory = latent_proj.unsqueeze(1)                # (B, 1, D)
+
+        # 3) build decoder input (autoregressive target tokens)
+        #    We use the latent_proj as a start-token-like embedding, repeated across T
+        rep = latent_proj.unsqueeze(1).repeat(1, target_len, 1)  # (B, L, D)
+
+        # 4) add positional encoding
+        pe = self.pos[:target_len].to(device).unsqueeze(0)       # (1, L, D)
+        tgt = rep + pe                                           # (B, L, D)
+
+        # 5) causal mask to prevent attending to future positions
+        tgt_mask = self._causal_mask(target_len, device)         # (L, L)
+
+        # 6) TransformerDecoder: query=tgt, key/value=memory
+        #    memory is compact (S=1) but sufficient as conditioning context
+        h = self.transformer(tgt, memory=memory, tgt_mask=tgt_mask)  # (B, L, D)
+
+        out = self.out(h)  # (B, L, feat)
+
         if mask is not None:
             out = out * mask.unsqueeze(-1).float()
         return out
@@ -333,8 +428,18 @@ def get_timestep_embedding(timesteps, dim):
 def train():
 
     print('Load Dataset')
-    ds = WorldModelDataset(list(range(100)))
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    # ds = WorldModelDataset(list(range(2000))) # Replace
+    # loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    
+    ds = WorldModelDataset("processed_dataset")  # .pt 샘플 로딩
+    loader = DataLoader(
+        ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=collate_fn
+    )
+
 
     print('Define model and optimizer')
     model = WorldModel().to(DEVICE)
@@ -439,21 +544,21 @@ def sample_one_step(model: WorldModel, obs_tick, obs_mask, news_list, macro_vec,
 # Example: run train (if executed as script)
 # ---------------------------
 if __name__ == "__main__":
-    # train()
+    train()
 
-    # Example of sampling after training (pseudo)
-    model = WorldModel().to(DEVICE)
-    ck = torch.load(os.path.join(CKPT_DIR, "wm_epoch_18.pt"))
-    model.load_state_dict(ck["model"])
-    model.eval()
-    # create dummy obs
-    obs_tick = torch.randn(1, MAX_OBS_TICKS, TICK_FEAT_DIM)
-    obs_mask = torch.zeros(1, MAX_OBS_TICKS).bool()
-    obs_mask[0, :200] = 1
-    news = ["earnings release"]
-    macro = torch.randn(1, MACRO_DIM_IN)
-    gen = sample_one_step(model, obs_tick, obs_mask, news, macro, target_len=300)
-    print("generated shape:", gen.shape)
+    # # Example of sampling after training (pseudo)
+    # model = WorldModel().to(DEVICE)
+    # ck = torch.load(os.path.join(CKPT_DIR, "wm_epoch_18.pt"))
+    # model.load_state_dict(ck["model"])
+    # model.eval()
+    # # create dummy obs
+    # obs_tick = torch.randn(1, MAX_OBS_TICKS, TICK_FEAT_DIM)
+    # obs_mask = torch.zeros(1, MAX_OBS_TICKS).bool()
+    # obs_mask[0, :200] = 1
+    # news = ["earnings release"]
+    # macro = torch.randn(1, MACRO_DIM_IN)
+    # gen = sample_one_step(model, obs_tick, obs_mask, news, macro, target_len=300)
+    # print("generated shape:", gen.shape)
     
-    import pdb
-    pdb.set_trace()
+    # import pdb
+    # pdb.set_trace()
