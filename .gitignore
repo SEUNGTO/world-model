@@ -7,5 +7,9 @@ processed_dataset/*
 *.json
 wm_ckpt/*
 
+# python
+__pychache__/
+*.pyc
+
 # playground, test script
 test.py

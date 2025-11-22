@@ -1,9 +1,11 @@
 # financial_worldmodel.py
 import os
 import math
-import random
+import pandas as pd
+import shutil
+import time
 from typing import List, Optional, Tuple
-
+from build_dataset import build_tesnor_process
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,22 +17,17 @@ from transformers import AutoTokenizer, AutoModel
 # ---------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 8
-EPOCHS = 40
-LR = 3e-4
+EPOCHS = 20
+LR = 1e-4
 HF_AVAILABLE = True
 
 # Feature sizes
-TICK_FEAT_DIM = 3        # e.g., [price, volume, trade_type]
-MACRO_DIM_IN = 10        # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
-LATENT_DIM = 128         # latent world-state dimensionality (s_t)
-FUSED_DIM = 128          # fusion dim
-MAX_OBS_TICKS = 1024     # pad length for observation tick seq
-MAX_TARGET_TICKS = 1024  # pad length for target tick seq
-
-# 실제 데이터 기준 parameter
-TICK_FEAT_DIM = 12
-MAX_OBS_TICKS = 2**15
-
+MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
+LATENT_DIM       = 128    # latent world-state dimensionality (s_t)
+FUSED_DIM        = 128    # fusion dim
+TICK_FEAT_DIM    = 12     # tick feature dimension (from build_dataset)
+MAX_OBS_TICKS    = 2**11  # maximum observed tick sequence length
+MAX_TARGET_TICKS = 2**11  # maximum target tick sequence length (next observation)
 
 DIFFUSION_STEPS = 500
 SAMPLE_STEPS = 100
@@ -67,55 +64,6 @@ scheduler = LatentDiffusionScheduler()
 # ---------------------------
 # Dataset skeleton
 # ---------------------------
-# class WorldModelDataset(Dataset):
-#     """
-#     Returns:
-#       - obs_tick: (MAX_OBS_TICKS, feat) padded
-#       - obs_mask: (MAX_OBS_TICKS,) bool
-#       - news_texts: List[str] per sample
-#       - macro_vec: (MACRO_DIM_IN,)
-#       - next_tick: (MAX_TARGET_TICKS, feat)
-#       - next_mask: (MAX_TARGET_TICKS,)
-#     """
-#     # 2025. 11. 18. 데이터를 어떻게 설계할 지 고민해봐야 함
-#     # 일단 tick data는 어떤 변수를 넣을지 고민해보고
-#     # 고민한 결과에 맞게 데이터를 구성할 필요 있음
-#     # GPT에 물어보면 데이터를 전처리 한 후에 tensor로 저장하는 게 가장 좋다고 함
-#     # 전처리 하는 로직은 다시 고민
-
-#     def __init__(self, index_list):
-#         super().__init__()
-#         self.indexes = index_list
-
-#     def __len__(self):
-#         return len(self.indexes)
-
-#     def __getitem__(self, idx):
-#         # Replace this with real data loading
-#         # Simulate variable-length tick sequences
-#         n_obs = random.randint(50, 600)
-#         n_next = random.randint(50, 800)
-#         obs = torch.randn(n_obs, TICK_FEAT_DIM)
-#         obs_padded = torch.zeros(MAX_OBS_TICKS, TICK_FEAT_DIM)
-#         obs_padded[:n_obs] = obs
-#         obs_mask = torch.zeros(MAX_OBS_TICKS, dtype=torch.bool)
-#         obs_mask[:n_obs] = 1
-
-#         nxt = torch.randn(n_next, TICK_FEAT_DIM)
-#         nxt_padded = torch.zeros(MAX_TARGET_TICKS, TICK_FEAT_DIM)
-#         nxt_padded[:n_next] = nxt
-#         nxt_mask = torch.zeros(MAX_TARGET_TICKS, dtype=torch.bool)
-#         nxt_mask[:n_next] = 1
-
-#         news = ["company A beats earnings", "central bank decision"] if random.random() < 0.7 else []
-#         macro = torch.randn(MACRO_DIM_IN)
-
-#         return {
-#             "obs_tick": obs_padded, "obs_mask": obs_mask,
-#             "news": news, "macro": macro,
-#             "next_tick": nxt_padded, "next_mask": nxt_mask
-#         }
-
 class WorldModelDataset(Dataset):
     def __init__(self, root="processed_dataset"):
         super().__init__()
@@ -133,7 +81,6 @@ class WorldModelDataset(Dataset):
             "obs_tick": data["obs_tick"],
             "obs_mask": data["obs_mask"],
             "news": data["news"],
-            "macro": data["macro"],
             "next_tick": data["next_tick"],
             "next_mask": data["next_mask"],
         }
@@ -160,15 +107,19 @@ class TickEncoder(nn.Module):
         self.net = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.out = nn.Linear(hidden, hidden)
+        self.norm = nn.LayerNorm(hidden)
 
     def forward(self, x, mask=None):
         # x: (B, L, C)
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
+        
         x = x.transpose(1,2)  # -> (B, C, L)
         h = self.net(x)       # (B, hidden, L)
         if mask is not None:
             mask_f = mask.unsqueeze(1).float()  # (B,1,L)
             h = h * mask_f
         p = self.pool(h).squeeze(-1)  # (B, hidden)
+        p = self.norm(p)
         return self.out(p)            # (B, hidden)
 
 class NewsEncoder(nn.Module):
@@ -234,24 +185,26 @@ class MacroEncoder(nn.Module):
 # ---------------------------
 # Fusion & Latent state projection
 # ---------------------------
+# macro 제외 버전
 class FusionNet(nn.Module):
-    def __init__(self, tick_dim=LATENT_DIM, news_dim=LATENT_DIM, macro_dim=LATENT_DIM, out_dim=LATENT_DIM):
+    def __init__(self, tick_dim=LATENT_DIM, news_dim=LATENT_DIM, out_dim=LATENT_DIM):
         super().__init__()
         self.tick_proj = nn.Linear(tick_dim, out_dim)
         self.news_proj = nn.Linear(news_dim, out_dim)
-        self.macro_proj = nn.Linear(macro_dim, out_dim)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=out_dim, nhead=4, batch_first=True),
             num_layers=2
         )
         self.out = nn.Linear(out_dim, out_dim)
 
-    def forward(self, h_tick, h_news, h_macro):
+
+    def forward(self, h_tick, h_news):
         # each: (B, d)
-        seq = torch.stack([self.tick_proj(h_tick), self.news_proj(h_news), self.macro_proj(h_macro)], dim=1)  # (B,3,d)
-        fused = self.transformer(seq)  # (B,3,d)
+        seq = torch.stack([self.tick_proj(h_tick), self.news_proj(h_news)], dim=1)  # (B,2,d)
+        fused = self.transformer(seq)  # (B,2,d)
         pooled = fused.mean(dim=1)     # (B,d)
         return self.out(pooled)        # (B,d)  -> s_t
+
 
 # ---------------------------
 # Latent diffusion transition model (predict noise in latent space)
@@ -390,17 +343,19 @@ class WorldModel(nn.Module):
         super().__init__()
         self.tick_enc = TickEncoder()
         self.news_enc = NewsEncoder()
-        self.macro_enc = MacroEncoder()
+        # self.macro_enc = MacroEncoder()
         self.fusion = FusionNet()
         self.latent_denoiser = LatentDenoiser()
         self.decoder = LatentToTicksDecoder()
-
-    def encode_obs(self, obs_tick, obs_mask, news_list, macro_vec):
+   
+    def encode_obs(self, obs_tick, obs_mask, news_list):
+        # macro 없는 버전
         # obs_tick: (B, MAX_OBS_TICKS, feat)
         H_tick = self.tick_enc(obs_tick, obs_mask)
         H_news = self.news_enc(news_list)
-        H_macro = self.macro_enc(macro_vec)
-        s_t = self.fusion(H_tick, H_news, H_macro)  # (B, latent_dim)
+        # H_macro = self.macro_enc(macro_vec)
+        s_t = self.fusion(H_tick, H_news)  # (B, latent_dim)
+
         return s_t
 
     def denoise_latent(self, z_noisy, cond, t_emb=None):
@@ -426,80 +381,153 @@ def get_timestep_embedding(timesteps, dim):
 # Training loop
 # ---------------------------
 def train():
-
-    print('Load Dataset')
-    # ds = WorldModelDataset(list(range(2000))) # Replace
-    # loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     
-    ds = WorldModelDataset("processed_dataset")  # .pt 샘플 로딩
-    loader = DataLoader(
-        ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collate_fn
-    )
-
-
-    print('Define model and optimizer')
+    print('[*] Configure training...')
     model = WorldModel().to(DEVICE)
     optim = torch.optim.AdamW(model.parameters(), lr=LR)
+    best_loss = float("inf")
+    best_ckpt_path = None
+    patience = 3
+    no_improve = 0
+    
+    date_range = pd.date_range(start='2014-01-01', end = '2014-12-31', freq = "MS")
 
-    print('Training begins')
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0.0
-        for batch in loader:
-            B = len(batch)
-            obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
-            obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
-            next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
-            next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
-            news_list = [b["news"] for b in batch]
-            macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
+    for date in date_range :
+        # -----------------------------
+        # 1. 데이터 전처리 > Tensor로 저장
+        # -----------------------------
+        print(f'[1] {date.strftime("%Y-%m")} Data Preprocessing')
+        build_tesnor_process(date, MAX_OBS_TICKS, TICK_FEAT_DIM)
 
-            # 1) encode current obs -> s_t
-            s_t = model.encode_obs(obs_tick, obs_mask, news_list, macro)  # (B, latent)
+        # -----------------------------
+        # 2. Dataset loading
+        # -----------------------------
+        print(f'[2] Dataset Loading')
+        ds = WorldModelDataset("processed_dataset")  # .pt 샘플 로딩
+        loader = DataLoader(
+            ds,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=collate_fn
+        )
 
-            # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
-            #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
-            #    In production, the "next observation" should include next window's news & macro as available.
-            s_next_target = model.tick_enc(next_tick, next_mask)  # (B, latent)
-            # Optionally fuse with zeros for news/macro; keeping simple.
+        # -----------------------------
+        # 3. Traning Loop
+        # -----------------------------
+        train_start_time = time.time()
+        print('[3] Training Loop begins')
+        for epoch in range(EPOCHS):
+            epoch_start_time = time.time()
+            model.train()
+            total_loss = 0.0
+            for batch in loader:
+                B = len(batch)
+                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
+                obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
+                next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
+                next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
+                news_list = [b["news"] for b in batch]
+                # macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
 
-            # ---------- Latent diffusion loss ----------
-            t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
-            noise = torch.randn_like(s_next_target)
-            z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
-            t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
-            # predict noise from z_t conditioned on s_t
-            noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
-            loss_diff = F.mse_loss(noise_pred, noise)
+                # # normalize
+                # mean = obs_tick.mean(dim=1, keepdim=True)
+                # str = obs_tick.std(dim=1, keepdim=True) + 1e-6
+                # obs_tick = (obs_tick - mean) / str
+                # next_tick = (next_tick - mean) / str
 
-            # ---------- Reconstruction loss ----------
-            # decode s_next_target -> reconstruct next_tick
-            pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
-            # compute MSE only on valid positions
-            mask_f = next_mask.unsqueeze(-1).float()
-            recon_loss = F.mse_loss(pred_next_tick * mask_f, next_tick * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
+                # 1) encode current obs -> s_t
+                s_t = model.encode_obs(obs_tick, obs_mask, news_list)  # (B, latent), macro 제외
 
-            loss = loss_diff + recon_loss
+                # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
+                #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
+                #    In production, the "next observation" should include next window's news & macro as available.
+                s_next_target = model.tick_enc(next_tick, next_mask)  # (B, latent)
+                # Optionally fuse with zeros for news/macro; keeping simple.
 
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
+                # ---------- Latent diffusion loss ----------
+                t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
+                noise = torch.randn_like(s_next_target)
+                z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
+                t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
+                # predict noise from z_t conditioned on s_t
+                noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
+                loss_diff = F.mse_loss(noise_pred, noise)
 
-            total_loss += loss.item()
+                # ---------- Reconstruction loss ----------
+                # decode s_next_target -> reconstruct next_tick
+                pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
+                # compute MSE only on valid positions
+                mask_f = next_mask.unsqueeze(-1).float()
+                recon_loss = F.mse_loss(pred_next_tick * mask_f, next_tick * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
 
-        avg = total_loss / len(loader)
-        print(f"[Epoch {epoch+1}/{EPOCHS}] loss={avg:.6f}")
+                loss = loss_diff + recon_loss
+                
+                
+                # ---- debug check ----
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print("\n================= NAN DETECTED =================")
+                    print("loss_diff:", loss_diff.item(), "recon_loss:", recon_loss.item())
+                    print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    print("s_next_target range:", s_next_target.min().item(), s_next_target.max().item())
+                    print("z_t:", z_t.min().item(), z_t.max().item())
+                    print("noise_pred:", noise_pred.min().item(), noise_pred.max().item())
+                    break
+                # -----------------------------------------
 
-        # save checkpoint
-        torch.save({
-            "epoch": epoch+1,
-            "model": model.state_dict(),
-            "optim": optim.state_dict()
-        }, os.path.join(CKPT_DIR, f"wm_epoch_{epoch+1}.pt"))
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+                total_loss += loss.item()
+
+            avg = total_loss / len(loader)
+            epoch_end_time = time.time()
+            print(f"[{date.strftime("%Y-%m")}][Epoch {epoch+1}/{EPOCHS}] loss={avg:.6f}, time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
+            
+            if avg < best_loss:
+                no_improve = 0
+                best_loss = avg
+
+                ckpt_name = f"wm_{date.strftime('%Y-%m')}_best.pt"
+                ckpt_path = os.path.join(CKPT_DIR, ckpt_name)
+
+                if best_ckpt_path is not None and os.path.exists(best_ckpt_path):
+                    os.remove(best_ckpt_path)
+
+                torch.save(
+                    {
+                        "month": date.strftime('%Y-%m'),
+                        "epoch": epoch+1,
+                        "loss": best_loss,
+                        "model": model.state_dict(),
+                        "optim": optim.state_dict(),
+                    },
+                    ckpt_path
+                )
+                best_ckpt_path = ckpt_path
+                print(f">>> Saved best checkpoint: {ckpt_path}, loss={best_loss:.6f}")
+
+            else:
+                no_improve += 1
+                print(f"No improvement count: {no_improve}")
+
+                if no_improve >= patience:
+                    print(">>> Early stopping triggered.")
+                    break
+
+
+        train_end_time = time.time()
+        print(f" - Training for {date.strftime('%Y-%m')} completed in {(train_end_time - train_start_time)/60:.2f} min")
+        # -----------------------------                
+        # 4. Clean up temp files
+        # -----------------------------                
+        shutil.rmtree("processed_dataset")
+        shutil.rmtree("timespan_tick")
+        shutil.rmtree("timespan_news")
+        shutil.rmtree("tick")
+        
+        torch.cuda.empty_cache()
 
 # ---------------------------
 # Sampling / rollout
