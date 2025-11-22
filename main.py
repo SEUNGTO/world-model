@@ -388,11 +388,12 @@ def train():
     best_loss = float("inf")
     best_ckpt_path = None
     patience = 3
-    no_improve = 0
-    
+
     date_range = pd.date_range(start='2014-01-01', end = '2014-12-31', freq = "MS")
 
     for date in date_range :
+        no_improve = 0
+        
         # -----------------------------
         # 1. 데이터 전처리 > Tensor로 저장
         # -----------------------------
@@ -403,6 +404,7 @@ def train():
         # 2. Dataset loading
         # -----------------------------
         print(f'[2] Dataset Loading')
+        print()
         ds = WorldModelDataset("processed_dataset")  # .pt 샘플 로딩
         loader = DataLoader(
             ds,
@@ -417,6 +419,7 @@ def train():
         # -----------------------------
         train_start_time = time.time()
         print('[3] Training Loop begins')
+        print()
         for epoch in range(EPOCHS):
             epoch_start_time = time.time()
             model.train()

@@ -1,7 +1,6 @@
 # tick, 뉴스 데이터를 timespan 단위로 변환하여 저장
 # 작업 성격상, 한 달 데이터를 사용해야 함
 import os
-import pdb
 import pandas as pd
 import gzip
 import shutil
@@ -19,7 +18,6 @@ def build_tesnor_process(date, MAX_OBS_TICKS = 2**13, TICK_FEAT_DIM=12) :
 
 def build_timespan_tick(date, minutes=10, chunk_size = 100000) :
     print("[ Building timespan tick data ]")
-    print(f"Processing date: {date.strftime('%Y-%m')}")
 
     # 압축해제
     print(" - Decompressing tick data...")
@@ -118,6 +116,7 @@ def build_timespan_news(date, minutes=10) :
         for period, group in news.groupby('period_start'): 
             out_file = f'timespan_news/[{minutes}min]{period.strftime("%Y-%m-%d %H-%M")}.csv'
             group[use_cols].to_csv(out_file, sep = "\t", index = False)
+    print()
     print()
 
 def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=12):
