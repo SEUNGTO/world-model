@@ -426,66 +426,184 @@ def train():
             epoch_start_time = time.time()
             model.train()
             total_loss = 0.0
-            for batch in loader:
+            # for batch in loader:
+            #     B = len(batch)
+            #     obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
+            #     obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
+            #     next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
+            #     next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
+            #     news_list = [b["news"] for b in batch]
+            #     # macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
+
+            #     # normalize
+            #     mean = obs_tick.mean(dim=1, keepdim=True)   # (B,1,C)
+            #     std  = obs_tick.std(dim=1, keepdim=True) + 1e-6
+            #     obs_tick_norm = (obs_tick - mean) / std
+            #     next_tick_norm = (next_tick - mean) / std    # **use same mean/std** so decoder target matches encoder scale
+
+
+            #     # 1) encode current obs -> s_t
+            #     s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)  # (B, latent), macro 제외
+
+            #     # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
+            #     #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
+            #     #    In production, the "next observation" should include next window's news & macro as available.
+            #     s_next_target = model.tick_enc(next_tick_norm, next_mask)  # (B, latent)
+            #     # Optionally fuse with zeros for news/macro; keeping simple.
+
+            #     # ---------- Latent diffusion loss ----------
+            #     t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
+            #     noise = torch.randn_like(s_next_target)
+            #     z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
+            #     t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
+            #     # predict noise from z_t conditioned on s_t
+            #     noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
+            #     loss_diff = F.mse_loss(noise_pred, noise)
+
+            #     # ---------- Reconstruction loss ----------
+            #     # decode s_next_target -> reconstruct next_tick
+            #     pred_next_tick_norm = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
+            #     # compute MSE only on valid positions
+            #     mask_f = next_mask.unsqueeze(-1).float()
+            #     recon_loss = F.mse_loss(pred_next_tick_norm * mask_f, next_tick_norm * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
+
+            #     loss = loss_diff + recon_loss
+                
+                
+            #     # ---- debug check ----
+            #     if torch.isnan(loss) or torch.isinf(loss):
+            #         print("\n================= NAN DETECTED =================")
+            #         print("loss_diff:", loss_diff.item(), "recon_loss:", recon_loss.item())
+            #         print("pred range:", pred_next_tick_norm.min().item(), pred_next_tick_norm.max().item())
+            #         print("s_next_target range:", s_next_target.min().item(), s_next_target.max().item())
+            #         print("z_t:", z_t.min().item(), z_t.max().item())
+            #         print("noise_pred:", noise_pred.min().item(), noise_pred.max().item())
+            #         break
+            #     # -----------------------------------------
+
+            #     optim.zero_grad()
+            #     loss.backward()
+            #     optim.step()
+
+            #     total_loss += loss.item()
+
+
+            # ---------- Replace the inner training loop with this diagnostic + stable step ----------
+            for batch_idx, batch in enumerate(loader):
                 B = len(batch)
-                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
+                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)   # (B, L, C)
                 obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
                 next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
                 next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
                 news_list = [b["news"] for b in batch]
-                # macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
 
-                # normalize
+                # QUICK SANITY: check NaNs/Infs in raw data
+                def has_bad(t):
+                    return torch.isnan(t).any().item() or torch.isinf(t).any().item()
+
+                if has_bad(obs_tick) or has_bad(next_tick):
+                    print(">>> BAD INPUT DETECTED (NaN or Inf). Dumping stats and skipping batch.")
+                    print("obs_tick has_nan:", torch.isnan(obs_tick).any().item(), "has_inf:", torch.isinf(obs_tick).any().item())
+                    print("next_tick has_nan:", torch.isnan(next_tick).any().item(), "has_inf:", torch.isinf(next_tick).any().item())
+                    continue
+
+                # --- Basic per-batch normalization strategy (use obs stats to normalize both obs & next) ---
+                # If features include price-like columns with very large magnitude, consider log/returns transform.
                 mean = obs_tick.mean(dim=1, keepdim=True)   # (B,1,C)
                 std  = obs_tick.std(dim=1, keepdim=True) + 1e-6
                 obs_tick_norm = (obs_tick - mean) / std
-                next_tick_norm = (next_tick - mean) / std    # **use same mean/std** so decoder target matches encoder scale
+                next_tick_norm = (next_tick - mean) / std
 
+                # Optional clamp to avoid extreme values (helps early instability)
+                clamp_val = 1e3
+                obs_tick_norm = obs_tick_norm.clamp(-clamp_val, clamp_val)
+                next_tick_norm = next_tick_norm.clamp(-clamp_val, clamp_val)
 
-                # 1) encode current obs -> s_t
-                s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)  # (B, latent), macro 제외
+                # encode
+                s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)
+                s_next_target = model.tick_enc(next_tick_norm, next_mask)
 
-                # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
-                #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
-                #    In production, the "next observation" should include next window's news & macro as available.
-                s_next_target = model.tick_enc(next_tick_norm, next_mask)  # (B, latent)
-                # Optionally fuse with zeros for news/macro; keeping simple.
-
-                # ---------- Latent diffusion loss ----------
+                # Latent diffusion loss
                 t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
                 noise = torch.randn_like(s_next_target)
-                z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
+                z_t = scheduler.q_sample(s_next_target, t, noise=noise)
                 t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
-                # predict noise from z_t conditioned on s_t
                 noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
-                loss_diff = F.mse_loss(noise_pred, noise)
+                loss_diff = F.mse_loss(noise_pred, noise, reduction='mean')
 
-                # ---------- Reconstruction loss ----------
-                # decode s_next_target -> reconstruct next_tick
-                pred_next_tick_norm = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
-                # compute MSE only on valid positions
-                mask_f = next_mask.unsqueeze(-1).float()
-                recon_loss = F.mse_loss(pred_next_tick_norm * mask_f, next_tick_norm * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
+                # Reconstruction: decode s_next_target to reconstruct normalized next_tick
+                pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
 
-                loss = loss_diff + recon_loss
-                
-                
-                # ---- debug check ----
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print("\n================= NAN DETECTED =================")
-                    print("loss_diff:", loss_diff.item(), "recon_loss:", recon_loss.item())
-                    print("pred range:", pred_next_tick_norm.min().item(), pred_next_tick_norm.max().item())
-                    print("s_next_target range:", s_next_target.min().item(), s_next_target.max().item())
-                    print("z_t:", z_t.min().item(), z_t.max().item())
-                    print("noise_pred:", noise_pred.min().item(), noise_pred.max().item())
-                    break
-                # -----------------------------------------
+                mask_f = next_mask.unsqueeze(-1).float()  # (B, L, 1)
+                # compute mean MSE only over valid positions
+                # sum_over_pos / valid_count ensures stable scaling independent of sequence lengths
+                sq_err = ((pred_next_tick - next_tick_norm) ** 2) * mask_f
+                recon_loss = sq_err.sum() / (mask_f.sum() * next_tick.size(-1) + 1e-8)  # mean per feature-position
 
-                optim.zero_grad()
+                # Safety: replace NaN/Infs in intermediate tensors
+                if torch.isnan(loss_diff) or torch.isnan(recon_loss) or torch.isinf(loss_diff) or torch.isinf(recon_loss):
+                    print(">>> NaN/Inf in loss components. Dumping debug info and skipping update.")
+                    print("loss_diff:", loss_diff, "recon_loss:", recon_loss)
+                    print("pred_next_tick min/max:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    print("s_next_target min/max:", s_next_target.min().item(), s_next_target.max().item())
+                    continue
+
+                # Balance losses (tune alpha/beta if needed). Start with equal weight.
+                alpha = 1.0  # weight for diffusion loss
+                beta = 1.0   # weight for recon loss (you may reduce this if recon dominates)
+                loss = alpha * loss_diff + beta * recon_loss
+
+                # Logging diagnostics for first few batches / or when loss huge
+                if batch_idx % 10 == 0:
+                    print(f"[batch {batch_idx}] loss={loss.item():.6e} loss_diff={loss_diff.item():.6e} recon={recon_loss.item():.6e}")
+                    print("obs_tick range:", obs_tick.min().item(), obs_tick.max().item(), " next_tick range:", next_tick.min().item(), next_tick.max().item())
+                    print("normed next range:", next_tick_norm.min().item(), next_tick_norm.max().item())
+                    print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    print("mask valid positions:", mask_f.sum().item(), "/", mask_f.numel())
+
+                # Backprop with gradient clipping and safe-step
+                optim.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # inspect gradient norms (detect explosions)
+                total_grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2).item()
+                        total_grad_norm += param_norm ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                if total_grad_norm > 1e6:
+                    print(">>> Gradient explosion detected, grad_norm=", total_grad_norm)
+                    # optional: skip update or scale gradients down
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            p.grad.data = p.grad.data.clamp_(-1e3, 1e3)
+
+                # clip gradients to stabilize
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optim.step()
 
-                total_loss += loss.item()
+                # # accumulate for epoch logging
+                # total_loss += loss.item()
+                # total_recon += recon_loss.item()
+                # total_diff += loss_diff.item()
+
+                # # Extra safety: if loss is astronomically large, stop and dump
+                # if loss.item() > 1e12:
+                #     print(">>> ABNORMAL LOSS (>1e12) detected. Dumping detailed stats and aborting epoch.")
+                #     print("Batch idx:", batch_idx)
+                #     print("loss:", loss.item(), "loss_diff:", loss_diff.item(), "recon:", recon_loss.item())
+                #     # Print per-feature statistics for next_tick_norm and pred to find culprit features
+                #     feat_mean = next_tick_norm.view(-1, next_tick_norm.size(-1)).mean(dim=0)
+                #     feat_std  = next_tick_norm.view(-1, next_tick_norm.size(-1)).std(dim=0)
+                #     print("next_tick_norm per-feature mean:", feat_mean.cpu().numpy())
+                #     print("next_tick_norm per-feature std:", feat_std.cpu().numpy())
+                #     print("pred per-feature min/max:", pred_next_tick.view(-1, pred_next_tick.size(-1)).min(dim=0)[0].cpu().numpy(),
+                #                                     pred_next_tick.view(-1, pred_next_tick.size(-1)).max(dim=0)[0].cpu().numpy())
+                #     # abort epoch to inspect
+                #     break
+            # ---------- end replacement for loop ----------
 
             avg = total_loss / len(loader)
             epoch_end_time = time.time()
