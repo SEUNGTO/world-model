@@ -26,8 +26,8 @@ MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민�
 LATENT_DIM       = 2**8    # latent world-state dimensionality (s_t)
 FUSED_DIM        = 2**8    # fusion dim
 TICK_FEAT_DIM    = 12     # tick feature dimension (from build_dataset)
-MAX_OBS_TICKS    = 2**11  # maximum observed tick sequence length
-MAX_TARGET_TICKS = 2**11  # maximum target tick sequence length (next observation)
+MAX_OBS_TICKS    = 2**13  # maximum observed tick sequence length
+MAX_TARGET_TICKS = 2**13  # maximum target tick sequence length (next observation)
 
 DIFFUSION_STEPS = 500
 SAMPLE_STEPS = 100
@@ -426,6 +426,9 @@ def train():
             epoch_start_time = time.time()
             model.train()
             total_loss = 0.0
+            total_recon = 0.0
+            total_diff = 0.0
+            
             # for batch in loader:
             #     B = len(batch)
             #     obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
@@ -487,8 +490,6 @@ def train():
 
             #     total_loss += loss.item()
 
-
-            # ---------- Replace the inner training loop with this diagnostic + stable step ----------
             for batch_idx, batch in enumerate(loader):
                 B = len(batch)
                 obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)   # (B, L, C)
@@ -560,6 +561,7 @@ def train():
                     print("normed next range:", next_tick_norm.min().item(), next_tick_norm.max().item())
                     print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
                     print("mask valid positions:", mask_f.sum().item(), "/", mask_f.numel())
+                    print()
 
                 # Backprop with gradient clipping and safe-step
                 optim.zero_grad(set_to_none=True)
@@ -583,11 +585,12 @@ def train():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 optim.step()
+                
+                total_loss += loss.item()
+                total_recon += recon_loss.item()
+                total_diff += loss_diff.item()
 
                 # # accumulate for epoch logging
-                # total_loss += loss.item()
-                # total_recon += recon_loss.item()
-                # total_diff += loss_diff.item()
 
                 # # Extra safety: if loss is astronomically large, stop and dump
                 # if loss.item() > 1e12:
@@ -603,12 +606,16 @@ def train():
                 #                                     pred_next_tick.view(-1, pred_next_tick.size(-1)).max(dim=0)[0].cpu().numpy())
                 #     # abort epoch to inspect
                 #     break
-            # ---------- end replacement for loop ----------
+
 
             avg = total_loss / len(loader)
             epoch_end_time = time.time()
-            print(f"[{date.strftime("%Y-%m")}][Epoch {epoch+1}/{EPOCHS}] loss={avg:.6f}, time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
             
+            print("==============================")
+            print(f"[{date.strftime("%Y-%m")}][Epoch {epoch+1}/{EPOCHS}] | Time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
+            print(f" - Total Loss : {avg:.6f} | Recon Loss: {total_recon / len(loader):.6f} | Diff Loss: {total_diff / len(loader):.6f}")
+            print("==============================")
+
             if avg < best_loss:
                 no_improve = 0
                 best_loss = avg
