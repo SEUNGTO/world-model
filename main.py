@@ -23,8 +23,8 @@ HF_AVAILABLE = True
 
 # Feature sizes
 MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
-LATENT_DIM       = 128    # latent world-state dimensionality (s_t)
-FUSED_DIM        = 128    # fusion dim
+LATENT_DIM       = 2**8    # latent world-state dimensionality (s_t)
+FUSED_DIM        = 2**8    # fusion dim
 TICK_FEAT_DIM    = 12     # tick feature dimension (from build_dataset)
 MAX_OBS_TICKS    = 2**11  # maximum observed tick sequence length
 MAX_TARGET_TICKS = 2**11  # maximum target tick sequence length (next observation)
@@ -94,8 +94,8 @@ def collate_fn(batch):
 # ---------------------------
 # Encoders
 # ---------------------------
+# 1) TickEncoder 수정: 내부 정규화 제거 (forward에서 x = (x - x.mean...) 라인 주석/삭제)
 class TickEncoder(nn.Module):
-    """Conv-based tick encoder -> compress variable-length tick seq to latent vector s_obs."""
     def __init__(self, in_dim=TICK_FEAT_DIM, hidden=LATENT_DIM, n_layers=4):
         super().__init__()
         layers = []
@@ -111,8 +111,9 @@ class TickEncoder(nn.Module):
 
     def forward(self, x, mask=None):
         # x: (B, L, C)
-        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
-        
+        # NOTE: remove internal normalization — do it in training loop so encoder/decoder targets agree
+        # x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
+
         x = x.transpose(1,2)  # -> (B, C, L)
         h = self.net(x)       # (B, hidden, L)
         if mask is not None:
@@ -121,6 +122,7 @@ class TickEncoder(nn.Module):
         p = self.pool(h).squeeze(-1)  # (B, hidden)
         p = self.norm(p)
         return self.out(p)            # (B, hidden)
+
 
 class NewsEncoder(nn.Module):
     """Simple news encoder: optional HF BERT or averaged bag-of-words style."""
@@ -389,7 +391,7 @@ def train():
     best_ckpt_path = None
     patience = 3
 
-    date_range = pd.date_range(start='2014-01-01', end = '2014-12-31', freq = "MS")
+    date_range = pd.date_range(start='2014-01-01', end = '2017-12-31', freq = "MS")
 
     for date in date_range :
         no_improve = 0
@@ -433,19 +435,20 @@ def train():
                 news_list = [b["news"] for b in batch]
                 # macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
 
-                # # normalize
-                # mean = obs_tick.mean(dim=1, keepdim=True)
-                # str = obs_tick.std(dim=1, keepdim=True) + 1e-6
-                # obs_tick = (obs_tick - mean) / str
-                # next_tick = (next_tick - mean) / str
+                # normalize
+                mean = obs_tick.mean(dim=1, keepdim=True)   # (B,1,C)
+                std  = obs_tick.std(dim=1, keepdim=True) + 1e-6
+                obs_tick_norm = (obs_tick - mean) / std
+                next_tick_norm = (next_tick - mean) / std    # **use same mean/std** so decoder target matches encoder scale
+
 
                 # 1) encode current obs -> s_t
-                s_t = model.encode_obs(obs_tick, obs_mask, news_list)  # (B, latent), macro 제외
+                s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)  # (B, latent), macro 제외
 
                 # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
                 #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
                 #    In production, the "next observation" should include next window's news & macro as available.
-                s_next_target = model.tick_enc(next_tick, next_mask)  # (B, latent)
+                s_next_target = model.tick_enc(next_tick_norm, next_mask)  # (B, latent)
                 # Optionally fuse with zeros for news/macro; keeping simple.
 
                 # ---------- Latent diffusion loss ----------
@@ -459,10 +462,10 @@ def train():
 
                 # ---------- Reconstruction loss ----------
                 # decode s_next_target -> reconstruct next_tick
-                pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
+                pred_next_tick_norm = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
                 # compute MSE only on valid positions
                 mask_f = next_mask.unsqueeze(-1).float()
-                recon_loss = F.mse_loss(pred_next_tick * mask_f, next_tick * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
+                recon_loss = F.mse_loss(pred_next_tick_norm * mask_f, next_tick_norm * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
 
                 loss = loss_diff + recon_loss
                 
@@ -471,7 +474,7 @@ def train():
                 if torch.isnan(loss) or torch.isinf(loss):
                     print("\n================= NAN DETECTED =================")
                     print("loss_diff:", loss_diff.item(), "recon_loss:", recon_loss.item())
-                    print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    print("pred range:", pred_next_tick_norm.min().item(), pred_next_tick_norm.max().item())
                     print("s_next_target range:", s_next_target.min().item(), s_next_target.max().item())
                     print("z_t:", z_t.min().item(), z_t.max().item())
                     print("noise_pred:", noise_pred.min().item(), noise_pred.max().item())
