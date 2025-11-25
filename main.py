@@ -25,7 +25,7 @@ HF_AVAILABLE = True
 MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
 LATENT_DIM       = 2**8    # latent world-state dimensionality (s_t)
 FUSED_DIM        = 2**8    # fusion dim
-TICK_FEAT_DIM    = 12     # tick feature dimension (from build_dataset)
+TICK_FEAT_DIM    = 13     # tick feature dimension (from build_dataset)
 MAX_OBS_TICKS    = 2**13  # maximum observed tick sequence length
 MAX_TARGET_TICKS = 2**13  # maximum target tick sequence length (next observation)
 
@@ -400,7 +400,7 @@ def train():
         # 1. 데이터 전처리 > Tensor로 저장
         # -----------------------------
         print(f'[1] {date.strftime("%Y-%m")} Data Preprocessing')
-        build_tesnor_process(date, MAX_OBS_TICKS, TICK_FEAT_DIM)
+        build_tesnor_process(date, 10, MAX_OBS_TICKS, TICK_FEAT_DIM)
 
         # -----------------------------
         # 2. Dataset loading
@@ -429,66 +429,6 @@ def train():
             total_recon = 0.0
             total_diff = 0.0
             
-            # for batch in loader:
-            #     B = len(batch)
-            #     obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)
-            #     obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
-            #     next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
-            #     next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
-            #     news_list = [b["news"] for b in batch]
-            #     # macro = torch.stack([b["macro"] for b in batch], dim=0).to(DEVICE)
-
-            #     # normalize
-            #     mean = obs_tick.mean(dim=1, keepdim=True)   # (B,1,C)
-            #     std  = obs_tick.std(dim=1, keepdim=True) + 1e-6
-            #     obs_tick_norm = (obs_tick - mean) / std
-            #     next_tick_norm = (next_tick - mean) / std    # **use same mean/std** so decoder target matches encoder scale
-
-
-            #     # 1) encode current obs -> s_t
-            #     s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)  # (B, latent), macro 제외
-
-            #     # 2) encode next obs (teacher latent) -> s_{t+1} (we use next_tick as proxy obs)
-            #     #    For simplicity here we encode next_tick via tick encoder + zero news/macro (or reuse macro)
-            #     #    In production, the "next observation" should include next window's news & macro as available.
-            #     s_next_target = model.tick_enc(next_tick_norm, next_mask)  # (B, latent)
-            #     # Optionally fuse with zeros for news/macro; keeping simple.
-
-            #     # ---------- Latent diffusion loss ----------
-            #     t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
-            #     noise = torch.randn_like(s_next_target)
-            #     z_t = scheduler.q_sample(s_next_target, t, noise=noise)  # noisy latent samples
-            #     t_emb = get_timestep_embedding(t, LATENT_DIM*2).to(DEVICE)
-            #     # predict noise from z_t conditioned on s_t
-            #     noise_pred = model.denoise_latent(z_t, s_t, t_emb=t_emb)
-            #     loss_diff = F.mse_loss(noise_pred, noise)
-
-            #     # ---------- Reconstruction loss ----------
-            #     # decode s_next_target -> reconstruct next_tick
-            #     pred_next_tick_norm = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
-            #     # compute MSE only on valid positions
-            #     mask_f = next_mask.unsqueeze(-1).float()
-            #     recon_loss = F.mse_loss(pred_next_tick_norm * mask_f, next_tick_norm * mask_f, reduction='sum') / (mask_f.sum() + 1e-8)
-
-            #     loss = loss_diff + recon_loss
-                
-                
-            #     # ---- debug check ----
-            #     if torch.isnan(loss) or torch.isinf(loss):
-            #         print("\n================= NAN DETECTED =================")
-            #         print("loss_diff:", loss_diff.item(), "recon_loss:", recon_loss.item())
-            #         print("pred range:", pred_next_tick_norm.min().item(), pred_next_tick_norm.max().item())
-            #         print("s_next_target range:", s_next_target.min().item(), s_next_target.max().item())
-            #         print("z_t:", z_t.min().item(), z_t.max().item())
-            #         print("noise_pred:", noise_pred.min().item(), noise_pred.max().item())
-            #         break
-            #     # -----------------------------------------
-
-            #     optim.zero_grad()
-            #     loss.backward()
-            #     optim.step()
-
-            #     total_loss += loss.item()
 
             for batch_idx, batch in enumerate(loader):
                 B = len(batch)
@@ -510,13 +450,13 @@ def train():
 
                 # --- Basic per-batch normalization strategy (use obs stats to normalize both obs & next) ---
                 # If features include price-like columns with very large magnitude, consider log/returns transform.
-                mean = obs_tick.mean(dim=1, keepdim=True)   # (B,1,C)
-                std  = obs_tick.std(dim=1, keepdim=True) + 1e-6
+                mean = obs_tick.mean(dim=0, keepdim=True)
+                std  = obs_tick.std(dim=0, keepdim=True) + 1e-6
                 obs_tick_norm = (obs_tick - mean) / std
                 next_tick_norm = (next_tick - mean) / std
 
                 # Optional clamp to avoid extreme values (helps early instability)
-                clamp_val = 1e3
+                clamp_val = 1e8
                 obs_tick_norm = obs_tick_norm.clamp(-clamp_val, clamp_val)
                 next_tick_norm = next_tick_norm.clamp(-clamp_val, clamp_val)
 
@@ -589,24 +529,6 @@ def train():
                 total_loss += loss.item()
                 total_recon += recon_loss.item()
                 total_diff += loss_diff.item()
-
-                # # accumulate for epoch logging
-
-                # # Extra safety: if loss is astronomically large, stop and dump
-                # if loss.item() > 1e12:
-                #     print(">>> ABNORMAL LOSS (>1e12) detected. Dumping detailed stats and aborting epoch.")
-                #     print("Batch idx:", batch_idx)
-                #     print("loss:", loss.item(), "loss_diff:", loss_diff.item(), "recon:", recon_loss.item())
-                #     # Print per-feature statistics for next_tick_norm and pred to find culprit features
-                #     feat_mean = next_tick_norm.view(-1, next_tick_norm.size(-1)).mean(dim=0)
-                #     feat_std  = next_tick_norm.view(-1, next_tick_norm.size(-1)).std(dim=0)
-                #     print("next_tick_norm per-feature mean:", feat_mean.cpu().numpy())
-                #     print("next_tick_norm per-feature std:", feat_std.cpu().numpy())
-                #     print("pred per-feature min/max:", pred_next_tick.view(-1, pred_next_tick.size(-1)).min(dim=0)[0].cpu().numpy(),
-                #                                     pred_next_tick.view(-1, pred_next_tick.size(-1)).max(dim=0)[0].cpu().numpy())
-                #     # abort epoch to inspect
-                #     break
-
 
             avg = total_loss / len(loader)
             epoch_end_time = time.time()

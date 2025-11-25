@@ -6,13 +6,30 @@ import gzip
 import shutil
 import meta
 import torch
+import math
+from multiprocessing import Pool, cpu_count
+
+def encode_time(x):
+    x = str(x).zfill(9)   # 9자리 보장
+    h = int(x[0:2])
+    m = int(x[2:4])
+    s = int(x[4:6])
+    ms = int(x[6:9])      # millisecond
+
+    total_sec = h*3600 + m*60 + s + ms/1000.0
+    sec_norm = total_sec / 86400.0  # 하루 초 = 86400
+
+    sin_t = math.sin(2 * math.pi * sec_norm)
+    cos_t = math.cos(2 * math.pi * sec_norm)
+
+    return sin_t, cos_t
 
 
 
-def build_tesnor_process(date, MAX_OBS_TICKS = 2**13, TICK_FEAT_DIM=12) :
+def build_tesnor_process(date, minutes, MAX_OBS_TICKS = 2**13, TICK_FEAT_DIM=13) :
     
-    build_timespan_tick(date, minutes=10, chunk_size=100000)
-    build_timespan_news(date, minutes=10)
+    build_timespan_tick(date, minutes=minutes, chunk_size=100000)
+    build_timespan_news(date, minutes=minutes)
     build_tensor_data(MAX_OBS_TICKS = MAX_OBS_TICKS, TICK_FEAT_DIM = TICK_FEAT_DIM)
 
 
@@ -38,7 +55,8 @@ def build_timespan_tick(date, minutes=10, chunk_size = 100000) :
 
     use_cols = [
         'TRD_DD'           ,   # 체결일자
-        'TRD_TM'           ,   # 체결시각
+        'TIME_SIN'         ,   # 시간 벡터화 'TIME_SIN',
+        'TIME_COS'         ,   # 시간 벡터화 'TIME_COS',
         'TRD_PRC'          ,   # 체결가격
         'TRDVOL'           ,   # 체결수량
         'TRD_TM'           ,   # 체결시각
@@ -78,6 +96,9 @@ def build_timespan_tick(date, minutes=10, chunk_size = 100000) :
         # period 시작 시간 계산 (floor)
         period_start = chunk['TRADE_TIME'].dt.floor(f'{minutes}min')
         chunk['PERIOD_START'] = period_start
+        
+        # 2025-11-25 체결시간에 대해 수정
+        chunk[['TIME_SIN', 'TIME_COS']] = chunk['TRD_TM'].apply(lambda x: pd.Series(encode_time(x)))
 
         # period별 그룹화 후 CSV append
         os.makedirs('timespan_tick', exist_ok = True)
@@ -119,7 +140,7 @@ def build_timespan_news(date, minutes=10) :
     print()
     print()
 
-def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=12):
+def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=13):
     print("[ Building tensor ]")
     
     tick_dir = 'timespan_tick'
