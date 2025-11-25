@@ -537,6 +537,15 @@ def train():
             print(f"[{date.strftime("%Y-%m")}][Epoch {epoch+1}/{EPOCHS}] | Time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
             print(f" - Total Loss : {avg:.6f} | Recon Loss: {total_recon / len(loader):.6f} | Diff Loss: {total_diff / len(loader):.6f}")
             print("==============================")
+            
+            # save log
+            pd.DataFrame({
+                'month': date.strftime('%Y-%m'),
+                'epoch': epoch+1,
+                'loss': avg,
+                'recon_loss': total_recon / len(loader),
+                'diff_loss': total_diff / len(loader),
+            }).to_csv('loss_log.csv', mode='a', header=not os.path.exists('loss_log.csv'), index=False)
 
             if avg < best_loss:
                 no_improve = 0

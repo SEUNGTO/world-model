@@ -7,28 +7,11 @@ import shutil
 import meta
 import torch
 import math
-from multiprocessing import Pool, cpu_count
-
-def encode_time(x):
-    x = str(x).zfill(9)   # 9자리 보장
-    h = int(x[0:2])
-    m = int(x[2:4])
-    s = int(x[4:6])
-    ms = int(x[6:9])      # millisecond
-
-    total_sec = h*3600 + m*60 + s + ms/1000.0
-    sec_norm = total_sec / 86400.0  # 하루 초 = 86400
-
-    sin_t = math.sin(2 * math.pi * sec_norm)
-    cos_t = math.cos(2 * math.pi * sec_norm)
-
-    return sin_t, cos_t
-
 
 
 def build_tesnor_process(date, minutes, MAX_OBS_TICKS = 2**13, TICK_FEAT_DIM=13) :
     
-    build_timespan_tick(date, minutes=minutes, chunk_size=100000)
+    build_timespan_tick(date, minutes=minutes, chunk_size=1000000)
     build_timespan_news(date, minutes=minutes)
     build_tensor_data(MAX_OBS_TICKS = MAX_OBS_TICKS, TICK_FEAT_DIM = TICK_FEAT_DIM)
 
@@ -195,3 +178,20 @@ def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=13):
 
     print(f" - Saved {idx} data samples to {save_dir}")
     print()
+        
+def encode_time(x):
+    x = str(x).zfill(9)   # 9자리 보장
+    h = int(x[0:2])
+    m = int(x[2:4])
+    s = int(x[4:6])
+    ms = int(x[6:9])      # millisecond
+
+    total_sec = h*3600 + m*60 + s + ms/1000.0
+    sec_norm = total_sec / 86400.0  # 하루 초 = 86400
+
+    sin_t = math.sin(2 * math.pi * sec_norm)
+    cos_t = math.cos(2 * math.pi * sec_norm)
+
+    return sin_t, cos_t
+
+
