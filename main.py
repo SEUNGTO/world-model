@@ -25,7 +25,7 @@ HF_AVAILABLE = True
 MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
 LATENT_DIM       = 2**8    # latent world-state dimensionality (s_t)
 FUSED_DIM        = 2**8    # fusion dim
-TICK_FEAT_DIM    = 13     # tick feature dimension (from build_dataset)
+TICK_FEAT_DIM    = 11     # tick feature dimension (from build_dataset)
 MAX_OBS_TICKS    = 2**13  # maximum observed tick sequence length
 MAX_TARGET_TICKS = 2**13  # maximum target tick sequence length (next observation)
 
@@ -389,7 +389,7 @@ def train():
     optim = torch.optim.AdamW(model.parameters(), lr=LR)
     best_loss = float("inf")
     best_ckpt_path = None
-    patience = 3
+    patience = 4
 
     date_range = pd.date_range(start='2014-01-01', end = '2017-12-31', freq = "MS")
 
@@ -400,6 +400,7 @@ def train():
         # 1. 데이터 전처리 > Tensor로 저장
         # -----------------------------
         print(f'[1] {date.strftime("%Y-%m")} Data Preprocessing')
+        print()
         build_tesnor_process(date, 10, MAX_OBS_TICKS, TICK_FEAT_DIM)
 
         # -----------------------------
@@ -456,7 +457,7 @@ def train():
                 next_tick_norm = (next_tick - mean) / std
 
                 # Optional clamp to avoid extreme values (helps early instability)
-                clamp_val = 1e8
+                clamp_val = 1e6
                 obs_tick_norm = obs_tick_norm.clamp(-clamp_val, clamp_val)
                 next_tick_norm = next_tick_norm.clamp(-clamp_val, clamp_val)
 
@@ -545,7 +546,7 @@ def train():
                 'loss': avg,
                 'recon_loss': total_recon / len(loader),
                 'diff_loss': total_diff / len(loader),
-            }).to_csv('loss_log.csv', mode='a', header=not os.path.exists('loss_log.csv'), index=False)
+            }, index = [0]).to_csv('loss_log.csv', mode='a', header=not os.path.exists('loss_log.csv'), index=False)
 
             if avg < best_loss:
                 no_improve = 0

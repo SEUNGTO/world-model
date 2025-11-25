@@ -6,8 +6,8 @@ import gzip
 import shutil
 import meta
 import torch
-import math
-
+import numpy as np
+from multiprocessing import Pool, cpu_count
 
 def build_tesnor_process(date, minutes, MAX_OBS_TICKS = 2**13, TICK_FEAT_DIM=13) :
     
@@ -33,16 +33,14 @@ def build_timespan_tick(date, minutes=10, chunk_size = 100000) :
             shutil.copyfileobj(f_in, f_out)
 
     # timespan으로 데이터 쪼개기
-    print(f" - Spiliting tick data...")
+    print(f" - Spliting tick data...")
     needed_cols = [v['col_nm_eng'] for v in meta.tick_kosdaq]
 
     use_cols = [
-        'TRD_DD'           ,   # 체결일자
         'TIME_SIN'         ,   # 시간 벡터화 'TIME_SIN',
         'TIME_COS'         ,   # 시간 벡터화 'TIME_COS',
         'TRD_PRC'          ,   # 체결가격
         'TRDVOL'           ,   # 체결수량
-        'TRD_TM'           ,   # 체결시각
         'BID_MBR_NO'       ,   # 매수회원번호
         'BIDORD_TP_CD'     ,   # 매수호가유형코드
         'BID_INVST_TP_CD'  ,   # 매수투자자구분코드
@@ -52,42 +50,16 @@ def build_timespan_tick(date, minutes=10, chunk_size = 100000) :
         'LST_ASKBID_TP_CD',    # 최종매도매수구분코드
         ]
     
-    _len = len(pd.read_csv(output, sep="|", nrows=0).columns)
-    col_name = needed_cols[:_len]
+    col_name = needed_cols[:len(pd.read_csv(output, sep='|', nrows=0).columns)]
     
     chunks = pd.read_csv(output, 
                          sep="|", header=None, chunksize=chunk_size,
                          dtype={v['no']: v['datatype'] for v in meta.tick_kosdaq})
     
-
-    for chunk in chunks:
-        chunk.columns = col_name
-
-        # 날짜 컬럼 변환
-        chunk['TRADE_DATE'] = pd.to_datetime(chunk['TRADE_DATE'])
-        
-        # TRD_TM 벡터화 → timedelta
-        tm = chunk['TRD_TM'].astype(str).str.zfill(9)
-        chunk['TRADE_TIME'] = (
-            chunk['TRADE_DATE'] +
-            pd.to_timedelta(tm.str.slice(0, 2).astype(int), unit='h') +
-            pd.to_timedelta(tm.str.slice(2, 4).astype(int), unit='m') +
-            pd.to_timedelta(tm.str.slice(4, 6).astype(int), unit='s') +
-            pd.to_timedelta(tm.str.slice(6, 9).astype(int), unit='ms')
-        )
-
-        # period 시작 시간 계산 (floor)
-        period_start = chunk['TRADE_TIME'].dt.floor(f'{minutes}min')
-        chunk['PERIOD_START'] = period_start
-        
-        # 2025-11-25 체결시간에 대해 수정
-        chunk[['TIME_SIN', 'TIME_COS']] = chunk['TRD_TM'].apply(lambda x: pd.Series(encode_time(x)))
-
-        # period별 그룹화 후 CSV append
-        os.makedirs('timespan_tick', exist_ok = True)
-        for period, group in chunk.groupby('PERIOD_START'): 
-            out_file = f'timespan_tick/[{minutes}min]{period.strftime("%Y-%m-%d %H-%M")}.csv' 
-            group[use_cols].to_csv(out_file, sep="\t", index=False, mode='a', header=not os.path.exists(out_file))
+    os.makedirs('timespan_tick', exist_ok = True)
+    with Pool(cpu_count()) as pool:
+        for _ in pool.starmap(process_chunk_save, [(chunk, col_name, minutes, use_cols) for chunk in chunks]):
+            pass
     print()
 
 def build_timespan_news(date, minutes=10) :
@@ -124,6 +96,7 @@ def build_timespan_news(date, minutes=10) :
     print()
 
 def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=13):
+
     print("[ Building tensor ]")
     
     tick_dir = 'timespan_tick'
@@ -179,19 +152,25 @@ def build_tensor_data(MAX_OBS_TICKS=2**13, TICK_FEAT_DIM=13):
     print(f" - Saved {idx} data samples to {save_dir}")
     print()
         
-def encode_time(x):
-    x = str(x).zfill(9)   # 9자리 보장
-    h = int(x[0:2])
-    m = int(x[2:4])
-    s = int(x[4:6])
-    ms = int(x[6:9])      # millisecond
-
-    total_sec = h*3600 + m*60 + s + ms/1000.0
-    sec_norm = total_sec / 86400.0  # 하루 초 = 86400
-
-    sin_t = math.sin(2 * math.pi * sec_norm)
-    cos_t = math.cos(2 * math.pi * sec_norm)
-
-    return sin_t, cos_t
-
-
+def process_chunk_save(chunk, col_name, minutes, use_cols):
+    chunk.columns = col_name
+    tm = chunk['TRD_TM'].astype(str).str.zfill(9)
+    sec = (tm.str[:2].astype(int)*3600 +
+           tm.str[2:4].astype(int)*60 +
+           tm.str[4:6].astype(int) +
+           tm.str[6:9].astype(int)/1000)
+    sec_norm = sec / 86400
+    chunk['TIME_SIN'] = np.round(np.sin(2*np.pi*sec_norm), 10)
+    chunk['TIME_COS'] = np.round(np.cos(2*np.pi*sec_norm), 10)
+    
+    # 날짜 변환
+    chunk['TRADE_DATE'] = pd.to_datetime(chunk['TRADE_DATE'])
+    chunk['TRADE_TIME'] = chunk['TRADE_DATE'] + pd.to_timedelta(sec, unit='s')
+    chunk['PERIOD_START'] = chunk['TRADE_TIME'].dt.floor(f'{minutes}min')
+    
+    out_dir = 'timespan_tick'
+    os.makedirs(out_dir, exist_ok=True)
+    
+    for period, group in chunk.groupby('PERIOD_START'):
+        out_file = os.path.join(out_dir, f"[{minutes}min]{period.strftime('%Y-%m-%d %H-%M')}.csv")
+        group[use_cols].to_csv(out_file, sep='\t', index=False, mode='a', header=not os.path.exists(out_file))
