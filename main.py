@@ -5,7 +5,6 @@ import pandas as pd
 import shutil
 import time
 from typing import List, Optional, Tuple
-from build_dataset import build_tesnor_process
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,18 +15,18 @@ from transformers import AutoTokenizer, AutoModel
 # Config / Hyperparameters
 # ---------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 8
+BATCH_SIZE = 16  # for A100 50% (VRAM=40GB)
+GRAD_ACCUM_STEPS = 2  # Accumulate 2 steps to simulate batch_size=32
 EPOCHS = 20
 LR = 1e-4
-HF_AVAILABLE = True
+HF_AVAILABLE = True  # Enabled - 40GB GPU can handle BERT
 
 # Feature sizes
-MACRO_DIM_IN     = 10     # 거시경제 변수를 몇 개나 넣을지 고민해봐야 함
-LATENT_DIM       = 2**8    # latent world-state dimensionality (s_t)
-FUSED_DIM        = 2**8    # fusion dim
+LATENT_DIM       = 2**8    # Back to 256 - 40GB can handle full model
+FUSED_DIM        = 2**8    # Back to 256 - 40GB can handle full model
 TICK_FEAT_DIM    = 11     # tick feature dimension (from build_dataset)
-MAX_OBS_TICKS    = 2**13  # maximum observed tick sequence length
-MAX_TARGET_TICKS = 2**13  # maximum target tick sequence length (next observation)
+MAX_OBS_TICKS    = 2**13  # Keep at 8192 to match preprocessed data
+MAX_TARGET_TICKS = 2**13  # Keep at 8192 to match preprocessed data
 
 DIFFUSION_STEPS = 500
 SAMPLE_STEPS = 100
@@ -76,12 +75,23 @@ class WorldModelDataset(Dataset):
     def __getitem__(self, idx):
         file_path = os.path.join(self.root, self.files[idx])
         data = torch.load(file_path, weights_only=False)
+        
+        # Pre-normalize on CPU during loading (better than doing it every batch)
+        obs_tick = data["obs_tick"]
+        next_tick = data["next_tick"]
+        
+        # Use obs stats to normalize both
+        mean = obs_tick.mean(dim=0, keepdim=True)
+        std = obs_tick.std(dim=0, keepdim=True) + 1e-6
+        
+        obs_tick_norm = ((obs_tick - mean) / std).clamp(-1e6, 1e6)
+        next_tick_norm = ((next_tick - mean) / std).clamp(-1e6, 1e6)
 
         return {
-            "obs_tick": data["obs_tick"],
+            "obs_tick": obs_tick_norm,
             "obs_mask": data["obs_mask"],
             "news": data["news"],
-            "next_tick": data["next_tick"],
+            "next_tick": next_tick_norm,
             "next_mask": data["next_mask"],
         }
 
@@ -126,9 +136,10 @@ class TickEncoder(nn.Module):
 
 class NewsEncoder(nn.Module):
     """Simple news encoder: optional HF BERT or averaged bag-of-words style."""
-    def __init__(self, out_dim=LATENT_DIM, hf_model_name="bert-base-uncased"):
+    def __init__(self, out_dim=LATENT_DIM, hf_model_name="distilbert-base-uncased"):
         super().__init__()
         self.out_dim = out_dim
+        self.cache = {}  # Cache news embeddings to avoid recomputation
         if HF_AVAILABLE:
             self.tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
             self.bert = AutoModel.from_pretrained(hf_model_name)
@@ -145,6 +156,9 @@ class NewsEncoder(nn.Module):
         # news_batch: list length B of list-of-strings
         B = len(news_batch)
         device = next(self.parameters()).device
+        # Ensure BERT is on correct device
+        if HF_AVAILABLE and self.bert.device != device:
+            self.bert = self.bert.to(device)
         out_list = []
         for texts in news_batch:
             if len(texts) == 0:
@@ -153,11 +167,16 @@ class NewsEncoder(nn.Module):
             pieces = []
             if HF_AVAILABLE:
                 for t in texts:
-                    toks = self.tokenizer(t, truncation=True, max_length=64, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        out = self.bert(**toks, return_dict=True)
-                    cls = out.last_hidden_state[:,0,:].squeeze(0)  # (bert_dim,)
-                    pieces.append(cls)
+                    # Check cache first
+                    if t in self.cache:
+                        pieces.append(self.cache[t])
+                    else:
+                        toks = self.tokenizer(t, truncation=True, max_length=64, return_tensors="pt").to(device)
+                        with torch.no_grad():
+                            out = self.bert(**toks, return_dict=True)
+                        cls = out.last_hidden_state[:,0,:].squeeze(0)  # (bert_dim,)
+                        self.cache[t] = cls  # Cache for reuse
+                        pieces.append(cls)
                 stacked = torch.stack(pieces, dim=0)  # (k, bert_dim)
                 reduced = self.proj(stacked)          # (k, out_dim)
             else:
@@ -173,16 +192,16 @@ class NewsEncoder(nn.Module):
             out_list.append(pooled)
         return torch.stack(out_list, dim=0)  # (B, out_dim)
 
-class MacroEncoder(nn.Module):
-    def __init__(self, in_dim=MACRO_DIM_IN, out_dim=LATENT_DIM):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim*2),
-            nn.ReLU(),
-            nn.Linear(out_dim*2, out_dim)
-        )
-    def forward(self, x):
-        return self.net(x)
+# class MacroEncoder(nn.Module):
+#     def __init__(self, in_dim=MACRO_DIM_IN, out_dim=LATENT_DIM):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(in_dim, out_dim*2),
+#             nn.ReLU(),
+#             nn.Linear(out_dim*2, out_dim)
+#         )
+#     def forward(self, x):
+#         return self.net(x)
 
 # ---------------------------
 # Fusion & Latent state projection
@@ -401,7 +420,7 @@ def train():
         # -----------------------------
         print(f'[1] {date.strftime("%Y-%m")} Data Preprocessing')
         print()
-        build_tesnor_process(date, 10, MAX_OBS_TICKS, TICK_FEAT_DIM)
+        #build_tensor_process(date, 10, MAX_OBS_TICKS, TICK_FEAT_DIM)
 
         # -----------------------------
         # 2. Dataset loading
@@ -413,8 +432,11 @@ def train():
             ds,
             batch_size=BATCH_SIZE,
             shuffle=True,
-            num_workers=4,
-            collate_fn=collate_fn
+            num_workers=8,  # Increased to 8 (all CPU cores) - CPU usage is low
+            collate_fn=collate_fn,
+            pin_memory=True,  # Faster CPU->GPU transfer
+            persistent_workers=True,  # Keep workers alive between epochs
+            prefetch_factor=4  # Each worker prefetches 4 batches ahead
         )
 
         # -----------------------------
@@ -430,13 +452,19 @@ def train():
             total_recon = 0.0
             total_diff = 0.0
             
-
+            batch_times = []
             for batch_idx, batch in enumerate(loader):
+                batch_start = time.time()
+                if batch_idx == 0:
+                    print(f">>> First batch loaded, starting GPU computation...")
+                    if torch.cuda.is_available():
+                        print(f">>> GPU memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f">>> GPU memory reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
                 B = len(batch)
-                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE)   # (B, L, C)
-                obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE)
-                next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE)
-                next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE)
+                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)   # (B, L, C)
+                obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
+                next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
+                next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
                 news_list = [b["news"] for b in batch]
 
                 # QUICK SANITY: check NaNs/Infs in raw data
@@ -449,20 +477,16 @@ def train():
                     print("next_tick has_nan:", torch.isnan(next_tick).any().item(), "has_inf:", torch.isinf(next_tick).any().item())
                     continue
 
-                # --- Basic per-batch normalization strategy (use obs stats to normalize both obs & next) ---
-                # If features include price-like columns with very large magnitude, consider log/returns transform.
-                mean = obs_tick.mean(dim=0, keepdim=True)
-                std  = obs_tick.std(dim=0, keepdim=True) + 1e-6
-                obs_tick_norm = (obs_tick - mean) / std
-                next_tick_norm = (next_tick - mean) / std
-
-                # Optional clamp to avoid extreme values (helps early instability)
-                clamp_val = 1e6
-                obs_tick_norm = obs_tick_norm.clamp(-clamp_val, clamp_val)
-                next_tick_norm = next_tick_norm.clamp(-clamp_val, clamp_val)
+                # Data is already normalized in __getitem__
+                obs_tick_norm = obs_tick
+                next_tick_norm = next_tick
 
                 # encode
+                if batch_idx == 0:
+                    print(f">>> Encoding observations (including BERT for news)...")
                 s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)
+                if batch_idx == 0:
+                    print(f">>> Encoding complete, computing loss...")
                 s_next_target = model.tick_enc(next_tick_norm, next_mask)
 
                 # Latent diffusion loss
@@ -497,45 +521,71 @@ def train():
 
                 # Logging diagnostics for first few batches / or when loss huge
                 if batch_idx % 10 == 0:
-                    print(f"[batch {batch_idx}] loss={loss.item():.6e} loss_diff={loss_diff.item():.6e} recon={recon_loss.item():.6e}")
-                    print("obs_tick range:", obs_tick.min().item(), obs_tick.max().item(), " next_tick range:", next_tick.min().item(), next_tick.max().item())
-                    print("normed next range:", next_tick_norm.min().item(), next_tick_norm.max().item())
-                    print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
-                    print("mask valid positions:", mask_f.sum().item(), "/", mask_f.numel())
+                    gpu_mem = torch.cuda.memory_allocated()/1e9 if torch.cuda.is_available() else 0
+                    batch_time = time.time() - batch_start
+                    samples_per_sec = BATCH_SIZE / batch_time
+                    print(f"[batch {batch_idx}] loss={loss.item():.6e} | GPU: {gpu_mem:.2f}GB | {batch_time:.2f}s/batch | {samples_per_sec:.1f} samples/s")
+                    print(f"  loss_diff={loss_diff.item():.6e} recon={recon_loss.item():.6e}")
+                    # print("obs_tick range:", obs_tick.min().item(), obs_tick.max().item(), " next_tick range:", next_tick.min().item(), next_tick.max().item())
+                    # print("normed next range:", next_tick_norm.min().item(), next_tick_norm.max().item())
+                    # print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    # print("mask valid positions:", mask_f.sum().item(), "/", mask_f.numel())
                     print()
 
-                # Backprop with gradient clipping and safe-step
-                optim.zero_grad(set_to_none=True)
+                # Backprop with gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS  # Scale loss
                 loss.backward()
 
-                # inspect gradient norms (detect explosions)
-                total_grad_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2).item()
-                        total_grad_norm += param_norm ** 2
-                total_grad_norm = total_grad_norm ** 0.5
-                if total_grad_norm > 1e6:
-                    print(">>> Gradient explosion detected, grad_norm=", total_grad_norm)
-                    # optional: skip update or scale gradients down
+                # Only update weights every GRAD_ACCUM_STEPS
+                if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
+                    # inspect gradient norms (detect explosions)
+                    total_grad_norm = 0.0
                     for p in model.parameters():
                         if p.grad is not None:
-                            p.grad.data = p.grad.data.clamp_(-1e3, 1e3)
+                            param_norm = p.grad.data.norm(2).item()
+                            total_grad_norm += param_norm ** 2
+                    total_grad_norm = total_grad_norm ** 0.5
+                    if total_grad_norm > 1e6:
+                        print(">>> Gradient explosion detected, grad_norm=", total_grad_norm)
+                        # optional: skip update or scale gradients down
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                p.grad.data = p.grad.data.clamp_(-1e3, 1e3)
 
-                # clip gradients to stabilize
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # clip gradients to stabilize
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                optim.step()
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
                 
-                total_loss += loss.item()
+                # Save loss values before deleting tensors
+                total_loss += (loss.item() * GRAD_ACCUM_STEPS)  # Unscale loss for logging
                 total_recon += recon_loss.item()
                 total_diff += loss_diff.item()
+                
+                # Delete intermediate tensors to free memory
+                del loss, loss_diff, recon_loss, pred_next_tick, s_t, s_next_target, noise, z_t, noise_pred
+                
+                batch_times.append(time.time() - batch_start)
+                if batch_idx == 0:
+                    print(f">>> First batch took {batch_times[0]:.2f}s")
+                
+                # Clear cache more frequently to avoid fragmentation and memory creep
+                if batch_idx % 20 == 0:
+                    torch.cuda.empty_cache()
 
             avg = total_loss / len(loader)
             epoch_end_time = time.time()
             
+            # GPU memory stats
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.max_memory_allocated() / 1e9
+                print(f">>> Peak GPU memory: {gpu_mem:.2f} GB")
+                torch.cuda.reset_peak_memory_stats()
+            
             print("==============================")
-            print(f"[{date.strftime("%Y-%m")}][Epoch {epoch+1}/{EPOCHS}] | Time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
+            print(f"[{date.strftime('%Y-%m')}][Epoch {epoch+1}/{EPOCHS}] | Time = {(epoch_end_time - epoch_start_time)/60:.2f} min")
+            print(f" - Avg batch time: {sum(batch_times)/len(batch_times):.3f}s")
             print(f" - Total Loss : {avg:.6f} | Recon Loss: {total_recon / len(loader):.6f} | Diff Loss: {total_diff / len(loader):.6f}")
             print("==============================")
             

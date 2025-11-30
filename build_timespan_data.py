@@ -40,6 +40,7 @@ def split_tick_to_period(file_nm, minutes=5, chunk_size=100000):
         period_start = chunk['TRADE_TIME'].dt.floor(f'{minutes}min')
         chunk['PERIOD_START'] = period_start
 
+
         # period별 그룹화 후 CSV append
         for period, group in chunk.groupby('PERIOD_START'):
             out_file = f'timespan_data/[TimeSpan_{minutes}]{period.strftime("%Y-%m-%d %H-%M")}.csv'
