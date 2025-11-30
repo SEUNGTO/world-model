@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModel
 # Config / Hyperparameters
 # ---------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 4
+BATCH_SIZE = 16  # for A100 50% (VRAM=40GB)
 GRAD_ACCUM_STEPS = 2  # Accumulate 2 steps to simulate batch_size=32
 EPOCHS = 20
 LR = 1e-4
@@ -25,8 +25,8 @@ HF_AVAILABLE = True  # Enabled - 40GB GPU can handle BERT
 LATENT_DIM       = 2**8    # Back to 256 - 40GB can handle full model
 FUSED_DIM        = 2**8    # Back to 256 - 40GB can handle full model
 TICK_FEAT_DIM    = 11     # tick feature dimension (from build_dataset)
-MAX_OBS_TICKS    = 2**10  # Keep at 4096 to match preprocessed data
-MAX_TARGET_TICKS = 2**10  # Keep at 4096 to match preprocessed data
+MAX_OBS_TICKS    = 2**13  # Keep at 8192 to match preprocessed data
+MAX_TARGET_TICKS = 2**13  # Keep at 8192 to match preprocessed data
 
 DIFFUSION_STEPS = 500
 SAMPLE_STEPS = 100
@@ -77,27 +77,24 @@ class WorldModelDataset(Dataset):
         data = torch.load(file_path, weights_only=False)
         
         # Pre-normalize on CPU during loading (better than doing it every batch)
-        # Expect obs_tick shape: (N, T, F)  (N = number of firms/assets)
-        obs_tick = data["obs_tick"]         # (N, T, F)
-        next_tick = data["next_tick"]       # (N, T_target, F)
+        obs_tick = data["obs_tick"]
+        next_tick = data["next_tick"]
         
-        # Use obs stats to normalize both; compute mean/std over (N, T) so we normalize features consistently
-        # result shapes will be (1,1,F) so broadcasting works for (N, T, F)
-        mean = obs_tick.mean(dim=(0,1), keepdim=True)   # (1,1,F)
-        std = obs_tick.std(dim=(0,1), keepdim=True) + 1e-6
+        # Use obs stats to normalize both
+        mean = obs_tick.mean(dim=0, keepdim=True)
+        std = obs_tick.std(dim=0, keepdim=True) + 1e-6
         
         obs_tick_norm = ((obs_tick - mean) / std).clamp(-1e6, 1e6)
         next_tick_norm = ((next_tick - mean) / std).clamp(-1e6, 1e6)
 
-        # Keep masks as provided. Expect obs_mask shape (N, T) boolean and obs_firm_mask shape (N,) boolean
         return {
-            "obs_tick": obs_tick_norm,                 # (N, T, F)
-            "obs_mask": data["obs_mask"],              # (N, T) bool-like
-            "obs_firm_mask": data["obs_firm_mask"],    # (N,) bool-like (which firms are present)
+            "obs_tick": obs_tick_norm,
+            "obs_mask": data["obs_mask"],
+            "obs_firm_mask": data["obs_firm_mask"],
             "news": data["news"],
-            "next_tick": next_tick_norm,               # (N, T_target, F)
-            "next_mask": data["next_mask"],            # (N, T_target)
-            "next_firm_mask": data["next_firm_mask"],  # (N,)
+            "next_tick": next_tick_norm,
+            "next_mask": data["next_mask"],
+            "next_firm_mask": data["next_firm_mask"],
         }
 
 
@@ -111,75 +108,30 @@ def collate_fn(batch):
 # ---------------------------
 # 1) TickEncoder 수정: 내부 정규화 제거 (forward에서 x = (x - x.mean...) 라인 주석/삭제)
 class TickEncoder(nn.Module):
-    """
-    Updated to handle inputs with firm dimension:
-      input x: (B, N, L, C)  where
-        B = batch size
-        N = number of firms/assets
-        L = time ticks
-        C = features per tick
-
-    Implementation detail:
-      - permute to (B, C, N, L) so Conv2d treats (N, L) as spatial dims and C as channels
-      - apply Conv2d stack -> (B, hidden, N, L)
-      - optional masking: mask_time (B, N, L), mask_firm (B, N)
-      - global pooling over (N, L) -> (B, hidden) -> LayerNorm -> linear out
-    """
     def __init__(self, in_dim=TICK_FEAT_DIM, hidden=LATENT_DIM, n_layers=4):
         super().__init__()
         layers = []
-        ch = in_dim  # channels = feature dim
+        ch = in_dim
         for i in range(n_layers):
-            # Conv2d: in_channels=ch, out_channels=hidden, kernel on (N,L)
-            layers.append(nn.Conv2d(ch, hidden, kernel_size=3, padding=1))
+            layers.append(nn.Conv1d(ch, hidden, kernel_size=3, padding=1))
             layers.append(nn.ReLU())
             ch = hidden
         self.net = nn.Sequential(*layers)
-        # pool spatial dims (N, L) -> (1,1)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.out = nn.Linear(hidden, hidden)
         self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, x, mask_time=None, mask_firm=None):
-        # x: (B, N, L, C)
-        # mask_time: (B, N, L)   -> per-firm per-time validity
-        # mask_firm: (B, N)      -> per-firm validity (True for valid firms)
+    def forward(self, x, mask=None):
+        # x: (B, L, C)
         # NOTE: remove internal normalization — do it in training loop so encoder/decoder targets agree
-        # x = (x - x.mean(dim=(1,2), keepdim=True)) / (x.std(dim=(1,2), keepdim=True) + 1e-6)
+        # x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
 
-        # bring features to channel dim for Conv2d
-        # to (B, C, N, L)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        h = self.net(x)  # (B, hidden, N, L)
-
-        # apply masks if provided
-        if mask_time is not None:
-            mask_time = mask_time.float()
-            if mask_time.dim() == 2:       # (N,L) -> (1,N,L)
-                mask_time = mask_time.unsqueeze(0)
-            elif mask_time.dim() == 1:     # (L,) -> (1,1,L)
-                mask_time = mask_time.unsqueeze(0).unsqueeze(1)
-            # h.shape = [B, C, N, L], mask_time shape = [B?, N, L] or broadcastable
-            mask_time = mask_time.unsqueeze(1)  # (B,1,N,L)
-            h = h * mask_time
-
-        if mask_firm is not None:
-            mask_firm = mask_firm.float()
-
-            # tick 차원이 없으면 추가
-            if mask_firm.dim() == 2:           # (B,N) -> (B,N,L)
-                mask_firm = mask_firm.unsqueeze(-1).expand(-1, -1, h.shape[3])
-            elif mask_firm.dim() == 3:         # (B,N,L) -> ok
-                if mask_firm.shape[2] != h.shape[3]:
-                    mask_firm = mask_firm.expand(-1, -1, h.shape[3])
-            else:
-                raise ValueError(f"Unexpected mask_firm dim: {mask_firm.shape}")
-
-            # channel 차원 추가
-            mf = mask_firm.unsqueeze(1)        # (B,1,N,L)
-            h = h * mf
-
-        p = self.pool(h).squeeze(-1).squeeze(-1)  # (B, hidden)
+        x = x.transpose(1,2)  # -> (B, C, L)
+        h = self.net(x)       # (B, hidden, L)
+        if mask is not None:
+            mask_f = mask.unsqueeze(1).float()  # (B,1,L)
+            h = h * mask_f
+        p = self.pool(h).squeeze(-1)  # (B, hidden)
         p = self.norm(p)
         return self.out(p)            # (B, hidden)
 
@@ -293,7 +245,42 @@ class LatentDenoiser(nn.Module):
 
 # ---------------------------
 # Decoder: latent -> tick sequence
+#   We'll implement a simple conditional sequence generator:
+#   - expand latent to sequence-length features
+#   - pass through Transformer encoder + linear output
 # ---------------------------
+# class LatentToTicksDecoder(nn.Module):
+#     def __init__(self, latent_dim=LATENT_DIM, out_feat=TICK_FEAT_DIM, model_dim=256, max_len=MAX_TARGET_TICKS):
+#         super().__init__()
+#         self.max_len = max_len
+#         self.latent_proj = nn.Linear(latent_dim, model_dim)
+#         enc_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=4, batch_first=True)
+#         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+#         self.pos = self._build_pe(model_dim, max_len)
+#         self.out = nn.Linear(model_dim, out_feat)
+
+#     def _build_pe(self, d_model, max_len):
+#         pe = torch.zeros(max_len, d_model)
+#         pos = torch.arange(0, max_len).unsqueeze(1).float()
+#         i = torch.arange(0, d_model, 2).float()
+#         div = torch.exp(i * -(math.log(10000.0) / d_model))
+#         pe[:, 0::2] = torch.sin(pos * div)
+#         pe[:, 1::2] = torch.cos(pos * div)
+#         return pe  # buffer registered in forward for simplicity
+
+#     def forward(self, latent, target_len, mask=None):
+#         # latent: (B, latent_dim)
+#         B = latent.size(0)
+#         device = latent.device
+#         rep = self.latent_proj(latent).unsqueeze(1).repeat(1, target_len, 1)  # (B, L, model_dim)
+#         pe = self.pos[:target_len, :].to(device).unsqueeze(0)  # (1, L, model_dim)
+#         h = rep + pe
+#         h = self.transformer(h)  # (B, L, model_dim)
+#         out = self.out(h)        # (B, L, feat)
+#         if mask is not None:
+#             out = out * mask.unsqueeze(-1).float()
+#         return out
+
 class LatentToTicksDecoder(nn.Module):
     def __init__(self, latent_dim=LATENT_DIM, out_feat=TICK_FEAT_DIM, model_dim=256, max_len=MAX_TARGET_TICKS):
         super().__init__()
@@ -373,14 +360,10 @@ class WorldModel(nn.Module):
         self.latent_denoiser = LatentDenoiser()
         self.decoder = LatentToTicksDecoder()
    
-    def encode_obs(self, obs_tick, obs_mask, obs_firm_mask, news_list):
-        """
-        obs_tick: (B, N, L, C)
-        obs_mask: (B, N, L)
-        obs_firm_mask: (B, N)
-        news_list: list-of-list (B,)
-        """
-        H_tick = self.tick_enc(obs_tick, mask_time=obs_mask, mask_firm=obs_firm_mask)
+    def encode_obs(self, obs_tick, obs_mask, news_list):
+        # macro 없는 버전
+        # obs_tick: (B, MAX_OBS_TICKS, feat)
+        H_tick = self.tick_enc(obs_tick, obs_mask)
         H_news = self.news_enc(news_list)
         # H_macro = self.macro_enc(macro_vec)
         s_t = self.fusion(H_tick, H_news)  # (B, latent_dim)
@@ -469,15 +452,10 @@ def train():
                         print(f">>> GPU memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
                         print(f">>> GPU memory reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
                 B = len(batch)
-                # Each b["obs_tick"] is (N, L, F) -> stack -> (B, N, L, F)
-                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)   # (B, N, L, C)
-                obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)     # (B, N, L)
-                obs_firm_mask = torch.stack([b["obs_firm_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)  # (B, N)
-
-                next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)   # (B, N, L2, C)
-                next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)     # (B, N, L2)
-                next_firm_mask = torch.stack([b["next_firm_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)  # (B, N)
-
+                obs_tick = torch.stack([b["obs_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)   # (B, L, C)
+                obs_mask = torch.stack([b["obs_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
+                next_tick = torch.stack([b["next_tick"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
+                next_mask = torch.stack([b["next_mask"] for b in batch], dim=0).to(DEVICE, non_blocking=True)
                 news_list = [b["news"] for b in batch]
 
                 # QUICK SANITY: check NaNs/Infs in raw data
@@ -497,11 +475,10 @@ def train():
                 # encode
                 if batch_idx == 0:
                     print(f">>> Encoding observations (including BERT for news)...")
-                s_t = model.encode_obs(obs_tick_norm, obs_mask, obs_firm_mask, news_list)
+                s_t = model.encode_obs(obs_tick_norm, obs_mask, news_list)
                 if batch_idx == 0:
                     print(f">>> Encoding complete, computing loss...")
-                # s_next_target: encode next ticks (use both next_mask and next_firm_mask)
-                s_next_target = model.tick_enc(next_tick_norm, mask_time=next_mask, mask_firm=next_firm_mask)
+                s_next_target = model.tick_enc(next_tick_norm, next_mask)
 
                 # Latent diffusion loss
                 t = torch.randint(0, scheduler.timesteps, (B,), device=DEVICE).long()
@@ -512,44 +489,20 @@ def train():
                 loss_diff = F.mse_loss(noise_pred, noise, reduction='mean')
 
                 # Reconstruction: decode s_next_target to reconstruct normalized next_tick
-                # NOTE: decoder expects mask shape (B, L). But here next_mask is (B, N, L_target)
-                # We reconstruct per-firm sequences aggregated? Current decoder returns (B, L, feat).
-                # We will reconstruct for the *pooled* representation, so use combined mask: valid if any firm has that time valid.
-                # Build time-level mask by OR over firms
-                combined_next_mask = (next_mask.any(dim=1)).to(dtype=torch.bool)  # (B, L_target)
+                pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(1), mask=next_mask)
 
-                pred_next_tick = model.decode(s_next_target, target_len=next_tick.size(2), mask=combined_next_mask)
-
-                # For recon loss, we need to compare predicted (B, L, feat) to some target representation.
-                # Original code expected next_tick to be (B, L, feat). But we currently have per-firm next_tick (B, N, L, feat).
-                # A simple consistent choice: compute target as **firm-aggregated** (e.g., mean over valid firms)
-                # Compute firm-weighted mean target per time:
-                # next_firm_mask: (B, N) ; next_mask: (B, N, L)
-                # mask for firm-time: (B, N, L)
-                mask_ft = next_mask.unsqueeze(-1).float()  # (B, N, L, 1)
-                # weighted sum across firms -> (B, L, feat)
-                weighted = (next_tick_norm * mask_ft).sum(dim=1)  # sum over N -> (B, L, feat)
-                counts = mask_ft.sum(dim=1)  # (B, L, 1)
-                # avoid div by zero
-                target_seq = weighted / (counts + 1e-8)  # (B, L, feat)
-                # target_seq will have NaN where counts==0 -> replace with zeros
-                target_seq = torch.nan_to_num(target_seq, nan=0.0, posinf=0.0, neginf=0.0)
-
-                mask_f = combined_next_mask.unsqueeze(-1).float()  # (B, L, 1)
+                mask_f = next_mask.unsqueeze(-1).float()  # (B, L, 1)
                 # compute mean MSE only over valid positions
-                sq_err = ((pred_next_tick - target_seq) ** 2) * mask_f
+                # sum_over_pos / valid_count ensures stable scaling independent of sequence lengths
+                sq_err = ((pred_next_tick - next_tick_norm) ** 2) * mask_f
                 recon_loss = sq_err.sum() / (mask_f.sum() * next_tick.size(-1) + 1e-8)  # mean per feature-position
 
                 # Safety: replace NaN/Infs in intermediate tensors
                 if torch.isnan(loss_diff) or torch.isnan(recon_loss) or torch.isinf(loss_diff) or torch.isinf(recon_loss):
                     print(">>> NaN/Inf in loss components. Dumping debug info and skipping update.")
                     print("loss_diff:", loss_diff, "recon_loss:", recon_loss)
-                    # When debugging, print ranges (guarded)
-                    try:
-                        print("pred_next_tick min/max:", pred_next_tick.min().item(), pred_next_tick.max().item())
-                        print("s_next_target min/max:", s_next_target.min().item(), s_next_target.max().item())
-                    except Exception:
-                        pass
+                    print("pred_next_tick min/max:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    print("s_next_target min/max:", s_next_target.min().item(), s_next_target.max().item())
                     continue
 
                 # Balance losses (tune alpha/beta if needed). Start with equal weight.
@@ -564,6 +517,10 @@ def train():
                     samples_per_sec = BATCH_SIZE / batch_time
                     print(f"[batch {batch_idx}] loss={loss.item():.6e} | GPU: {gpu_mem:.2f}GB | {batch_time:.2f}s/batch | {samples_per_sec:.1f} samples/s")
                     print(f"  loss_diff={loss_diff.item():.6e} recon={recon_loss.item():.6e}")
+                    # print("obs_tick range:", obs_tick.min().item(), obs_tick.max().item(), " next_tick range:", next_tick.min().item(), next_tick.max().item())
+                    # print("normed next range:", next_tick_norm.min().item(), next_tick_norm.max().item())
+                    # print("pred range:", pred_next_tick.min().item(), pred_next_tick.max().item())
+                    # print("mask valid positions:", mask_f.sum().item(), "/", mask_f.numel())
                     print()
 
                 # Backprop with gradient accumulation
@@ -599,8 +556,7 @@ def train():
                 
                 # Delete intermediate tensors to free memory
                 del loss, loss_diff, recon_loss, pred_next_tick, s_t, s_next_target, noise, z_t, noise_pred
-                del target_seq, mask_ft, weighted, counts, combined_next_mask
-
+                
                 batch_times.append(time.time() - batch_start)
                 if batch_idx == 0:
                     print(f">>> First batch took {batch_times[0]:.2f}s")
@@ -681,19 +637,18 @@ def train():
 # Sampling / rollout
 # ---------------------------
 @torch.no_grad()
-def sample_one_step(model: WorldModel, obs_tick, obs_mask, obs_firm_mask, news_list, target_len, steps=SAMPLE_STEPS):
+def sample_one_step(model: WorldModel, obs_tick, obs_mask, news_list, macro_vec, target_len, steps=SAMPLE_STEPS):
     """
     Given current observation, sample s_{t+1} from latent diffusion conditioned on s_t,
     then decode to ticks.
-
     Inputs:
-      obs_tick: (1, N, L, feat)
-      obs_mask: (1, N, L)
-      obs_firm_mask: (1, N)
+      obs_tick: (1, MAX_OBS_TICKS, feat)
+      obs_mask: (1, MAX_OBS_TICKS)
       news_list: list-of-strings (batch size 1)
+      macro_vec: (1, MACRO_DIM_IN)
     """
     device = next(model.parameters()).device
-    s_t = model.encode_obs(obs_tick.to(device), obs_mask.to(device), obs_firm_mask.to(device), [news_list])  # (1, latent)
+    s_t = model.encode_obs(obs_tick.to(device), obs_mask.to(device), [news_list], macro_vec.to(device))  # (1, latent)
 
     # Reverse diffusion sampling (ancestral DDPM)
     z = torch.randn(1, LATENT_DIM, device=device)  # start from noise
@@ -729,13 +684,10 @@ if __name__ == "__main__":
     # model.load_state_dict(ck["model"])
     # model.eval()
     # # create dummy obs
-    # obs_tick = torch.randn(1, 10, MAX_OBS_TICKS, TICK_FEAT_DIM)  # (B=1, N=10, L, F)
-    # obs_mask = torch.zeros(1, 10, MAX_OBS_TICKS).bool()
-    # obs_mask[0, :, :200] = 1
-    # obs_firm_mask = torch.ones(1, 10).bool()
+    # obs_tick = torch.randn(1, MAX_OBS_TICKS, TICK_FEAT_DIM)
+    # obs_mask = torch.zeros(1, MAX_OBS_TICKS).bool()
+    # obs_mask[0, :200] = 1
     # news = ["earnings release"]
-    # gen = sample_one_step(model, obs_tick, obs_mask, obs_firm_mask, news, target_len=300)
+    # macro = torch.randn(1, MACRO_DIM_IN)
+    # gen = sample_one_step(model, obs_tick, obs_mask, news, macro, target_len=300)
     # print("generated shape:", gen.shape)
-    
-    # import pdb
-    # pdb.set_trace()

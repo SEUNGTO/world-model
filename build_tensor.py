@@ -3,12 +3,13 @@
 import os
 import pandas as pd
 import torch
-from multiprocessing import Pool, cpu_count
+import pickle
 import pdb
+
 
 minutes = 10
 chunk_size = 1e6
-MAX_OBS_TICKS = 2**12
+MAX_OBS_TICKS = 2**10
 TICK_FEAT_DIM = 11
 
 use_stock = pd.read_excel("use_stock.xlsx", dtype = str)
@@ -17,6 +18,7 @@ MAX_FIRM_NUM = len(use_stock)
 
 TICK_DIR = 'D:\\data\\timespan_tick'
 NEWS_DIR = 'D:\\data\\timespan_news'
+INVEST_DIR = 'D:\\data\\invest_info'
 SAVE_DIR = 'processed_dataset'
 
 use_cols = [
@@ -36,12 +38,16 @@ use_cols = [
 
 
 def build_tensor_data(MAX_OBS_TICKS, TICK_FEAT_DIM, MAX_FIRM_NUM):
+    # (N, T, F) 형태의 텐서로 저장
+    # N : 종목 수 (MAX_FIRM_NUM)
+    # T : 최대 틱 수 (MAX_OBS_TICKS)
+    # F : 특징 수 (TICK_FEAT_DIM)
 
     print("[ Building tensor ]")
     
     os.makedirs(SAVE_DIR, exist_ok=True)
     
-    tick_data = sorted(os.listdir(TICK_DIR))   # 정렬 필수 (시간 순서 보장)
+    tick_data = sorted(os.listdir(TICK_DIR))
 
     idx = 0
 
@@ -65,12 +71,18 @@ def build_tensor_data(MAX_OBS_TICKS, TICK_FEAT_DIM, MAX_FIRM_NUM):
             news = []
             
         # read investment info
-        invest_path = os.listdir()
-        
+        invest_path = os.listdir(INVEST_DIR)
+        bs_dt = t1[6:16]
+        f_name = [f for f in invest_path if bs_dt in f]
+        if len(f_name) > 0 :
+            with open(os.path.join(INVEST_DIR, f_name[0]), 'rb') as f :
+                d = pickle.load(f)
+                news += d['content'].str.replace("\n", "").tolist()
         
         obs_firm_mask = torch.zeros(MAX_FIRM_NUM, dtype=torch.bool)
         nxt_firm_mask = torch.zeros(MAX_FIRM_NUM, dtype=torch.bool)
 
+        # 종목별로 차원 나누기
         for N in range(MAX_FIRM_NUM) :
 
             t1_tick_firm = t1_tick[t1_tick['JONG_INDEX'] == N].drop(columns=['JONG_INDEX']).copy()
@@ -80,16 +92,15 @@ def build_tensor_data(MAX_OBS_TICKS, TICK_FEAT_DIM, MAX_FIRM_NUM):
             obs_padded = torch.zeros((MAX_FIRM_NUM, MAX_OBS_TICKS, TICK_FEAT_DIM), dtype=torch.float32)
             obs_mask = torch.zeros((MAX_FIRM_NUM, MAX_OBS_TICKS), dtype=torch.bool)
             if n_obs > 0 :
-                obs_padded[N, :n_obs] = torch.from_numpy(t1_tick_firm.values).float()
+                obs_padded[N, :n_obs] = torch.from_numpy(t1_tick_firm.values[:MAX_OBS_TICKS]).float()
                 obs_mask[N, :n_obs] = 1
                 obs_firm_mask[N] = 1
-            
 
             n_next = len(t2_tick_firm)
             nxt_padded = torch.zeros((MAX_FIRM_NUM, MAX_OBS_TICKS, TICK_FEAT_DIM), dtype=torch.float32)
             nxt_mask = torch.zeros((MAX_FIRM_NUM, MAX_OBS_TICKS), dtype=torch.bool)
             if n_next > 0 :
-                nxt_padded[N, :n_next] = torch.from_numpy(t2_tick_firm.values).float()
+                nxt_padded[N, :n_next] = torch.from_numpy(t2_tick_firm.values[:MAX_OBS_TICKS]).float()
                 nxt_mask[N, :n_next] = 1
                 nxt_firm_mask[N] = 1
 
@@ -110,9 +121,6 @@ def build_tensor_data(MAX_OBS_TICKS, TICK_FEAT_DIM, MAX_FIRM_NUM):
 
     print(f" - Saved {idx} data samples to {SAVE_DIR}")
     print()
-        
-       
-        
+
 if __name__ == "__main__" :
     build_tensor_data(MAX_OBS_TICKS, TICK_FEAT_DIM, MAX_FIRM_NUM)
-    pass

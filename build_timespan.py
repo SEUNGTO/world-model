@@ -142,7 +142,7 @@ def process_chunk_save(chunk, col_name, minutes, use_cols):
         
 if __name__ == "__main__" :
 
-    date_range = pd.date_range(start='2014-08-01', end = '2023-12-31', freq = "MS")
+    date_range = pd.date_range(start='2014-10-01', end = '2023-12-31', freq = "MS")
 
     for date in date_range :
         print(f'[[ DATE : {date.strftime("%Y-%m")} ]]')
