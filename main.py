@@ -10,26 +10,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
+import config
 
 # ---------------------------
 # Config / Hyperparameters
 # ---------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 4
-GRAD_ACCUM_STEPS = 2  # Accumulate 2 steps to simulate batch_size=32
-EPOCHS = 20
-LR = 1e-4
+BATCH_SIZE = config.BATCH_SIZE
+GRAD_ACCUM_STEPS = config.GRAD_ACCUM_STEPS  # Accumulate 2 steps to simulate batch_size=32
+EPOCHS = config.EPOCHS
+LR = config.LR
 HF_AVAILABLE = True  # Enabled - 40GB GPU can handle BERT
 
 # Feature sizes
-LATENT_DIM       = 2**8    # Back to 256 - 40GB can handle full model
-FUSED_DIM        = 2**8    # Back to 256 - 40GB can handle full model
-TICK_FEAT_DIM    = 11     # tick feature dimension (from build_dataset)
-MAX_OBS_TICKS    = 2**10  # Keep at 4096 to match preprocessed data
-MAX_TARGET_TICKS = 2**10  # Keep at 4096 to match preprocessed data
+LATENT_DIM       = config.LATENT_DIM    # Back to 256 - 40GB can handle full model
+FUSED_DIM        = config.FUSED_DIM    # Back to 256 - 40GB can handle full model
+TICK_FEAT_DIM    = config.TICK_FEAT_DIM     # tick feature dimension (from build_dataset)
+MAX_OBS_TICKS    = config.MAX_OBS_TICKS     # Keep at 4096 to match preprocessed data
+MAX_TARGET_TICKS = config.MAX_TARGET_TICKS  # Keep at 4096 to match preprocessed data
 
-DIFFUSION_STEPS = 500
-SAMPLE_STEPS = 100
+DIFFUSION_STEPS = config.DIFFUSION_STEPS
+SAMPLE_STEPS = config.SAMPLE_STEPS
 
 CKPT_DIR = "./wm_ckpt"
 os.makedirs(CKPT_DIR, exist_ok=True)

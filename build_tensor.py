@@ -4,13 +4,14 @@ import os
 import pandas as pd
 import torch
 import pickle
+import config
 import pdb
 
 
-minutes = 10
-chunk_size = 1e6
-MAX_OBS_TICKS = 2**10
-TICK_FEAT_DIM = 11
+minutes = config.minutes
+chunk_size = config.chunk_size
+MAX_OBS_TICKS = config.MAX_OBS_TICKS
+TICK_FEAT_DIM = config.TICK_FEAT_DIM
 
 use_stock = pd.read_excel("use_stock.xlsx", dtype = str)
 new_index = {row.iloc[1] : row.iloc[0] for _, row in use_stock.iterrows()}

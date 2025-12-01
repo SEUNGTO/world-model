@@ -6,13 +6,15 @@ import gzip
 import shutil
 import meta
 import shutil
+import config
 import numpy as np
+
 from multiprocessing import Pool, cpu_count
 import warnings
 warnings.filterwarnings("ignore")
 
-minutes = 10
-chunk_size = 1e6
+minutes = config.minutes
+chunk_size = config.chunk_size
 
 use_stock = pd.read_excel("use_stock.xlsx", dtype = str)
 new_index = {row[1] : row[0] for _, row in use_stock.iterrows()}
@@ -142,7 +144,7 @@ def process_chunk_save(chunk, col_name, minutes, use_cols):
         
 if __name__ == "__main__" :
 
-    date_range = pd.date_range(start='2014-10-01', end = '2023-12-31', freq = "MS")
+    date_range = pd.date_range(start='2018-10-01', end = '2023-12-31', freq = "MS")
 
     for date in date_range :
         print(f'[[ DATE : {date.strftime("%Y-%m")} ]]')
