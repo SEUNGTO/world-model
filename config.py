@@ -16,4 +16,4 @@ SAMPLE_STEPS = 100
 
 # Data building
 minutes = 10
-chunk_size = 1e6
+chunk_size = 5e5

@@ -436,7 +436,7 @@ def train():
         # -----------------------------
         print(f'[2] Dataset Loading')
         print()
-        ds = WorldModelDataset("processed_dataset")  # .pt 샘플 로딩
+        ds = WorldModelDataset("D:\\processed_dataset")  # .pt 샘플 로딩
         loader = DataLoader(
             ds,
             batch_size=BATCH_SIZE,
